@@ -85,17 +85,36 @@
       $('#btn-start-fill').addEventListener('click', function () {
         var tplId = $('#filler-template-select').value;
         if (!tplId) { self.toast('请先选择一个模板', 'error'); return; }
-        var tpl = FB.storage.getTemplateLatest(tplId);
-        if (!tpl) { self.toast('模板不存在', 'error'); return; }
+        var latestTpl = FB.storage.getTemplateLatest(tplId);
+        if (!latestTpl) { self.toast('模板不存在', 'error'); return; }
 
         var allData = FB.storage.getFormDataAll(tplId);
         var drafts = allData.filter(function (r) { return r.data._draft; });
         var initialData = null;
         var recordId = FB.util.uid();
+        var tpl = latestTpl;
+
         if (drafts.length > 0) {
           if (confirm('发现未完成的草稿，是否继续编辑？')) {
-            initialData = drafts[drafts.length - 1].data;
-            recordId = drafts[drafts.length - 1].recordId;
+            var draft = drafts[drafts.length - 1];
+            initialData = draft.data;
+            recordId = draft.recordId;
+            var draftVersion = draft.data._templateVersion || draft.templateVersion;
+            if (draftVersion && draftVersion !== latestTpl.version) {
+              // Try to load the template version that matches the draft
+              var versionTpl = FB.storage.getTemplateVersion(tplId, draftVersion);
+              if (versionTpl) {
+                if (confirm('该草稿基于 v' + draftVersion + '，当前最新为 v' + latestTpl.version + '。\n确定 = 用原版本继续编辑\n取消 = 迁移到最新版本')) {
+                  tpl = versionTpl;
+                } else {
+                  tpl = latestTpl;
+                  self.toast('草稿已迁移到最新版本 v' + latestTpl.version, 'info');
+                }
+              } else {
+                tpl = latestTpl;
+                self.toast('原版本 v' + draftVersion + ' 不可用，已使用最新版本渲染', 'info');
+              }
+            }
           }
         }
 

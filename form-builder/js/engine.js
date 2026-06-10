@@ -107,9 +107,11 @@
       var versions = this.get('versions_' + tpl.id) || [];
       tpl.version = versions.length + 1;
       tpl.publishedAt = FB.util.now();
-      versions.push(FB.util.deepClone(tpl));
+      var snapshot = FB.util.deepClone(tpl);
+      snapshot._frozen = true;
+      versions.push(snapshot);
       this.set('versions_' + tpl.id, versions);
-      this.set('latest_' + tpl.id, tpl);
+      this.set('latest_' + tpl.id, FB.util.deepClone(tpl));
       // Update template index
       var index = this.get('template_index') || [];
       var idx = -1;
@@ -119,7 +121,7 @@
       var entry = { id: tpl.id, name: tpl.name, version: tpl.version, publishedAt: tpl.publishedAt };
       if (idx >= 0) index[idx] = entry; else index.push(entry);
       this.set('template_index', index);
-      return tpl;
+      return FB.util.deepClone(tpl);
     },
     getTemplateLatest: function (id) { return this.get('latest_' + id); },
     getTemplateVersions: function (id) { return this.get('versions_' + id) || []; },
@@ -280,6 +282,7 @@
               var row = v[ri];
               for (var si = 0; si < fc.subFields.length; si++) {
                 var sf = fc.subFields[si];
+                if (sf._deleted) continue;
                 var rowVal = row[sf.id];
                 if (sf.required && (rowVal === undefined || rowVal === null || rowVal === '')) {
                   errors.push('第 ' + (ri + 1) + ' 行 "' + sf.label + '" 不能为空');
@@ -354,8 +357,13 @@
   FB.logic = {
     isFieldHidden: function (field, values, allFields) {
       if (!field.conditions || field.conditions.length === 0) return false;
+      var fieldMap = {};
+      if (allFields) this._buildFieldMap(allFields, fieldMap);
       for (var i = 0; i < field.conditions.length; i++) {
-        if (!this._evalCondition(field.conditions[i], values)) return true;
+        var cond = field.conditions[i];
+        // Skip conditions referencing deleted or non-existent fields
+        if (cond.field && allFields && !fieldMap[cond.field]) continue;
+        if (!this._evalCondition(cond, values)) return true;
       }
       return false;
     },
@@ -463,6 +471,37 @@
       var result = [];
       for (var d in dependents) result.push(d);
       return result;
+    },
+
+    /**
+     * Remove conditions that reference non-existent (deleted) fields.
+     * Returns array of cleaned condition info.
+     */
+    cleanStaleConditions: function (fields) {
+      var fieldMap = {};
+      this._buildFieldMap(fields, fieldMap);
+      var cleaned = [];
+      var walk = function (fieldList) {
+        for (var i = 0; i < fieldList.length; i++) {
+          var f = fieldList[i];
+          if (f._deleted) continue;
+          if (f.conditions && f.conditions.length > 0) {
+            var validConditions = [];
+            for (var j = 0; j < f.conditions.length; j++) {
+              var cond = f.conditions[j];
+              if (cond.field && fieldMap[cond.field]) {
+                validConditions.push(cond);
+              } else if (cond.field) {
+                cleaned.push({ fieldId: f.id, fieldLabel: f.label, condition: cond });
+              }
+            }
+            f.conditions = validConditions;
+          }
+          if (f.type === 'group' && f.children) walk(f.children);
+        }
+      };
+      walk(fields);
+      return cleaned;
     }
   };
 
@@ -484,6 +523,9 @@
     },
     undo: function (currentState) {
       if (this._stack.length === 0) return null;
+      // Do not cross publish barriers
+      var top = this._stack[this._stack.length - 1];
+      if (top && top._barrier) return null;
       this._redoStack.push(FB.util.deepClone(currentState));
       var prev = this._stack.pop();
       this._notify();
@@ -498,6 +540,11 @@
     },
     clear: function () {
       this._stack = [];
+      this._redoStack = [];
+      this._notify();
+    },
+    pushBarrier: function () {
+      this._stack.push({ _barrier: true });
       this._redoStack = [];
       this._notify();
     },
@@ -583,6 +630,7 @@
         if (f.type === 'table') {
           if (f.subFields) {
             for (var j = 0; j < f.subFields.length; j++) {
+              if (f.subFields[j]._deleted) continue;
               headers.push(f.label + '.' + f.subFields[j].label);
             }
           }
@@ -611,6 +659,7 @@
             var rowData = tableData[ri] || {};
             if (tableFields[tf].subFields) {
               for (var sfi = 0; sfi < tableFields[tf].subFields.length; sfi++) {
+                if (tableFields[tf].subFields[sfi]._deleted) continue;
                 row.push(this._csvEscape(rowData[tableFields[tf].subFields[sfi].id] || ''));
               }
             }
@@ -689,11 +738,19 @@
   FB.compatibility = {
     mergeDataWithTemplate: function (template, data) {
       var merged = {};
+      var oldArchived = data._archived ? FB.util.deepClone(data._archived) : {};
       for (var key in data) {
         if (key.charAt(0) === '_') continue;
         merged[key] = data[key];
       }
       this._ensureDefaults(template.fields, merged);
+      // Archive orphaned data (fields no longer active in template)
+      this.archiveDeletedFields(template, merged);
+      // Merge previously archived data
+      if (!merged._archived) merged._archived = {};
+      for (var ak in oldArchived) {
+        if (!merged._archived[ak]) merged._archived[ak] = oldArchived[ak];
+      }
       return merged;
     },
 
@@ -714,17 +771,93 @@
       }
     },
 
+    /**
+     * Move data for deleted/missing fields into data._archived.
+     * Preserves values with label and deletion metadata.
+     */
+    archiveDeletedFields: function (template, data) {
+      if (!data._archived) data._archived = {};
+      var activeIds = {};
+      this._collectFieldIds(template.fields, activeIds);
+      var deletedInfo = {};
+      this._collectDeletedFieldInfo(template.fields, deletedInfo);
+
+      for (var key in data) {
+        if (key.charAt(0) === '_') continue;
+        if (!activeIds[key] && data[key] !== undefined && data[key] !== null && data[key] !== '') {
+          var info = deletedInfo[key] || {};
+          data._archived[key] = {
+            label: info.label || key,
+            value: data[key],
+            deletedAt: info.deletedAt || null,
+            fieldType: info.type || 'unknown'
+          };
+          delete data[key];
+        }
+      }
+      return data;
+    },
+
     getDeletedFieldsWithData: function (template, data) {
+      // Check both inline orphan keys and _archived entries
       var currentIds = {};
       this._collectFieldIds(template.fields, currentIds);
       var deleted = [];
+      // Orphan keys still in data
       for (var key in data) {
         if (key.charAt(0) === '_') continue;
         if (!currentIds[key] && data[key] !== undefined && data[key] !== '' && data[key] !== null) {
-          deleted.push({ id: key, value: data[key] });
+          var label = this.resolveFieldLabel(key, template) || key;
+          deleted.push({ id: key, label: label, value: data[key] });
+        }
+      }
+      // Archived entries
+      if (data._archived) {
+        for (var aKey in data._archived) {
+          var entry = data._archived[aKey];
+          deleted.push({ id: aKey, label: entry.label || aKey, value: entry.value, archived: true, deletedAt: entry.deletedAt });
         }
       }
       return deleted;
+    },
+
+    /**
+     * Resolve field label from template, including _deleted fields.
+     */
+    resolveFieldLabel: function (fieldId, template) {
+      var label = null;
+      var walk = function (fields) {
+        for (var i = 0; i < fields.length; i++) {
+          var f = fields[i];
+          if (f.id === fieldId) { label = f.label; return; }
+          if (f.type === 'group' && f.children) walk(f.children);
+          if (f.type === 'table' && f.subFields) {
+            for (var j = 0; j < f.subFields.length; j++) {
+              if (f.subFields[j].id === fieldId) { label = f.subFields[j].label; return; }
+            }
+          }
+        }
+      };
+      walk(template.fields);
+      return label;
+    },
+
+    _collectDeletedFieldInfo: function (fields, map) {
+      for (var i = 0; i < fields.length; i++) {
+        var f = fields[i];
+        if (f._deleted) {
+          map[f.id] = { label: f.label, type: f.type, deletedAt: f._deletedAt };
+        }
+        if (f.type === 'group' && f.children) this._collectDeletedFieldInfo(f.children, map);
+        if (f.type === 'table' && f.subFields) {
+          for (var j = 0; j < f.subFields.length; j++) {
+            var sf = f.subFields[j];
+            if (sf._deleted) {
+              map[sf.id] = { label: sf.label, type: sf.type, deletedAt: sf._deletedAt };
+            }
+          }
+        }
+      }
     },
 
     _collectFieldIds: function (fields, map) {
@@ -734,7 +867,7 @@
         if (f.type === 'group' && f.children) this._collectFieldIds(f.children, map);
         if (f.type === 'table' && f.subFields) {
           for (var j = 0; j < f.subFields.length; j++) {
-            map[f.subFields[j].id] = true;
+            if (!f.subFields[j]._deleted) map[f.subFields[j].id] = true;
           }
         }
       }

@@ -74,22 +74,43 @@
       meta.textContent = '模板版本: v' + this.template.version + ' | 记录ID: ' + this.recordId.slice(0, 12);
       form.appendChild(meta);
 
-      // Show deleted field data notice
+      // Show archived/deleted field data in collapsible panel
       var deletedWithData = FB.compatibility.getDeletedFieldsWithData(this.template, this.values);
       if (deletedWithData.length > 0) {
         var notice = document.createElement('div');
-        notice.style.cssText = 'background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:10px;margin-bottom:16px;font-size:12px;';
-        notice.innerHTML = '<strong>⚠ 旧字段数据:</strong> 以下字段已从模板中删除，但数据已保留：';
-        var ul = document.createElement('ul');
-        ul.style.cssText = 'margin:4px 0 0 16px;';
+        notice.className = 'archived-fields-panel';
+        notice.style.cssText = 'background:#fff3cd;border:1px solid #ffc107;border-radius:6px;margin-bottom:16px;font-size:12px;overflow:hidden;';
+        var header = document.createElement('div');
+        header.style.cssText = 'padding:10px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;font-weight:600;';
+        header.innerHTML = '<span>📦 已归档字段数据 (' + deletedWithData.length + ' 项)</span><span class="archive-toggle">▶</span>';
+        var body = document.createElement('div');
+        body.style.cssText = 'display:none;padding:0 10px 10px;border-top:1px solid #ffc107;';
+        var table = document.createElement('table');
+        table.style.cssText = 'width:100%;border-collapse:collapse;font-size:11px;';
+        table.innerHTML = '<thead><tr style="text-align:left;"><th style="padding:4px;">字段</th><th style="padding:4px;">值</th><th style="padding:4px;">状态</th></tr></thead>';
+        var tbody = document.createElement('tbody');
         for (var di = 0; di < deletedWithData.length; di++) {
           var d = deletedWithData[di];
-          var li = document.createElement('li');
           var val = Array.isArray(d.value) ? JSON.stringify(d.value) : String(d.value);
-          li.textContent = d.id.slice(0, 8) + ': ' + (val.length > 50 ? val.slice(0, 50) + '...' : val);
-          ul.appendChild(li);
+          if (val.length > 80) val = val.slice(0, 80) + '...';
+          var tr = document.createElement('tr');
+          tr.style.cssText = 'border-top:1px solid #f0e0a0;';
+          tr.innerHTML =
+            '<td style="padding:4px;">' + FB.util.escapeHtml(d.label) + '</td>' +
+            '<td style="padding:4px;word-break:break-all;">' + FB.util.escapeHtml(val) + '</td>' +
+            '<td style="padding:4px;color:#999;">' + (d.archived ? '已归档' : '孤儿数据') +
+            (d.deletedAt ? '<br>' + new Date(d.deletedAt).toLocaleDateString() : '') + '</td>';
+          tbody.appendChild(tr);
         }
-        notice.appendChild(ul);
+        table.appendChild(tbody);
+        body.appendChild(table);
+        header.addEventListener('click', function () {
+          var visible = body.style.display !== 'none';
+          body.style.display = visible ? 'none' : 'block';
+          header.querySelector('.archive-toggle').textContent = visible ? '▶' : '▼';
+        });
+        notice.appendChild(header);
+        notice.appendChild(body);
         form.appendChild(notice);
       }
 
@@ -274,22 +295,35 @@
     _renderTableField: function (f) {
       var rows = this.values[f.id] || [];
       var subs = f.subFields || [];
+      var activeSubs = subs.filter(function (s) { return !s._deleted; });
 
       var headerHtml = '';
-      for (var i = 0; i < subs.length; i++) {
-        headerHtml += '<th>' + FB.util.escapeHtml(subs[i].label) +
-          (subs[i].required ? '<span class="required-star">*</span>' : '') + '</th>';
+      for (var i = 0; i < activeSubs.length; i++) {
+        headerHtml += '<th>' + FB.util.escapeHtml(activeSubs[i].label) +
+          (activeSubs[i].required ? '<span class="required-star">*</span>' : '') + '</th>';
       }
       if (!this.isPreview) headerHtml += '<th class="row-actions">操作</th>';
 
       var bodyHtml = '';
       for (var ri = 0; ri < rows.length; ri++) {
-        bodyHtml += this._renderTableRow(f, rows[ri], ri, subs);
+        bodyHtml += this._renderTableRow(f, rows[ri], ri, activeSubs);
       }
 
       var hints = '';
       if (f.minRows) hints += '<div class="form-field-hint">最少 ' + f.minRows + ' 行</div>';
       if (f.maxRows) hints += '<div class="form-field-hint">最多 ' + f.maxRows + ' 行</div>';
+
+      // Detect archived column data in rows
+      var archivedCols = this._getArchivedTableColumns(f, rows);
+      var archiveHtml = '';
+      if (archivedCols.length > 0) {
+        archiveHtml = '<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:4px;padding:6px 8px;margin-top:6px;font-size:11px;">' +
+          '<strong>📦 旧列数据归档:</strong> ';
+        for (var ai = 0; ai < archivedCols.length; ai++) {
+          archiveHtml += '<span style="margin-right:8px;">' + FB.util.escapeHtml(archivedCols[ai].label) + ' (' + archivedCols[ai].count + ' 条)</span>';
+        }
+        archiveHtml += '</div>';
+      }
 
       return this._fieldLabel(f) +
         '<div class="detail-table-wrapper">' +
@@ -298,7 +332,34 @@
             '<tbody data-table-body="' + f.id + '">' + bodyHtml + '</tbody>' +
           '</table>' +
           (!this.isPreview ? '<button class="btn-add-row" data-add-row="' + f.id + '">+ 添加行</button>' : '') +
+          archiveHtml +
         '</div>' + hints;
+    },
+
+    _getArchivedTableColumns: function (field, rows) {
+      var activeSfIds = {};
+      var subs = field.subFields || [];
+      for (var i = 0; i < subs.length; i++) {
+        if (!subs[i]._deleted) activeSfIds[subs[i].id] = true;
+      }
+      var archived = {};
+      for (var ri = 0; ri < rows.length; ri++) {
+        for (var key in rows[ri]) {
+          if (!activeSfIds[key] && rows[ri][key] !== '' && rows[ri][key] !== undefined && rows[ri][key] !== null) {
+            if (!archived[key]) {
+              var sfLabel = key;
+              for (var si = 0; si < subs.length; si++) {
+                if (subs[si].id === key) { sfLabel = subs[si].label; break; }
+              }
+              archived[key] = { label: sfLabel, count: 0 };
+            }
+            archived[key].count++;
+          }
+        }
+      }
+      var result = [];
+      for (var ak in archived) result.push(archived[ak]);
+      return result;
     },
 
     _renderTableRow: function (field, rowData, rowIndex, subs) {
@@ -538,6 +599,7 @@
       var newRow = {};
       var subs = field.subFields || [];
       for (var j = 0; j < subs.length; j++) {
+        if (subs[j]._deleted) continue;
         newRow[subs[j].id] = subs[j].type === 'checkbox' ? [] : '';
       }
       rows.push(newRow);
@@ -570,7 +632,7 @@
       if (!tbody) return;
       tbody.innerHTML = '';
       var rows = this.values[fieldId] || [];
-      var subs = field.subFields || [];
+      var subs = (field.subFields || []).filter(function (s) { return !s._deleted; });
       for (var ri = 0; ri < rows.length; ri++) {
         var tr = document.createElement('tr');
         tr.dataset.rowIndex = ri;

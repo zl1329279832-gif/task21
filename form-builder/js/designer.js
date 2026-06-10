@@ -55,11 +55,15 @@
     /* ---- Load existing template ---- */
     loadTemplate: function (tpl) {
       this.template = FB.util.deepClone(tpl);
+      this.template._baseVersion = tpl.version || 0;
       $('#template-name').value = this.template.name;
       this.selectedFieldId = null;
       this.undoManager.clear();
       this._render();
       this._renderPropertyPanel();
+      if (tpl.version > 0) {
+        FB.App.toast('正在编辑 v' + tpl.version + ' 的副本，发布后将生成新版本', 'info');
+      }
     },
 
     /* ---- Toolbar ---- */
@@ -96,6 +100,7 @@
       }
       this.template.updatedAt = FB.util.now();
       var published = FB.storage.publishTemplate(this.template);
+      this.undoManager.pushBarrier();
       FB.App.toast('模板已发布 (v' + published.version + ')', 'success');
       FB.App.refreshTemplateSelects();
     },
@@ -383,6 +388,13 @@
           break;
         }
       }
+      // Clean stale conditions referencing deleted field
+      var cleaned = FB.logic.cleanStaleConditions(this.template.fields);
+      if (cleaned.length > 0) {
+        var labels = [];
+        for (var c = 0; c < cleaned.length; c++) labels.push(cleaned[c].fieldLabel);
+        FB.App.toast('已清理 ' + labels.join('、') + ' 的失效联动条件', 'info');
+      }
       if (this.selectedFieldId === fieldId) {
         this.selectedFieldId = null;
         this._renderPropertyPanel();
@@ -561,6 +573,7 @@
       html += '<div class="subfield-list">';
       for (var i = 0; i < subs.length; i++) {
         var sf = subs[i];
+        if (sf._deleted) continue;
         var typeOptions = '';
         for (var t = 0; t < subTypes.length; t++) {
           typeOptions += '<option value="' + subTypes[t] + '"' + (sf.type === subTypes[t] ? ' selected' : '') + '>' + FB.FIELD_TYPES[subTypes[t]].label + '</option>';
@@ -725,8 +738,11 @@
       $$('[data-sf-remove]', this.propContent).forEach(function (btn) {
         btn.addEventListener('click', function () {
           self._saveUndoState();
-          field.subFields.splice(Number(btn.dataset.sfRemove), 1);
+          var sfIdx = Number(btn.dataset.sfRemove);
+          field.subFields[sfIdx]._deleted = true;
+          field.subFields[sfIdx]._deletedAt = FB.util.now();
           self._renderPropertyPanel();
+          FB.App.toast('列已删除（旧数据仍保留该列值）', 'info');
         });
       });
 
