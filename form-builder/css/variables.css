@@ -1,0 +1,46 @@
+:root {
+  --primary: #1890ff;
+  --primary-light: #e6f7ff;
+  --primary-dark: #096dd9;
+  --success: #52c41a;
+  --warning: #faad14;
+  --danger: #e74c3c;
+  --danger-light: #fff1f0;
+
+  --text-primary: #333;
+  --text-secondary: #666;
+  --text-muted: #999;
+  --text-white: #fff;
+
+  --bg-body: #f0f2f5;
+  --bg-white: #fff;
+  --bg-light: #fafafa;
+  --bg-hover: #f5f5f5;
+
+  --border: #d9d9d9;
+  --border-light: #e8e8e8;
+  --border-lighter: #f0f0f0;
+
+  --radius: 4px;
+  --radius-lg: 8px;
+
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.06);
+  --shadow: 0 2px 8px rgba(0,0,0,0.1);
+  --shadow-lg: 0 4px 16px rgba(0,0,0,0.12);
+
+  --spacing-xs: 4px;
+  --spacing-sm: 8px;
+  --spacing-md: 12px;
+  --spacing-lg: 16px;
+  --spacing-xl: 24px;
+
+  --font-family: -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
+  --font-size: 14px;
+  --font-size-sm: 12px;
+  --font-size-lg: 16px;
+  --font-size-xl: 18px;
+
+  --header-height: 56px;
+  --palette-width: 220px;
+  --properties-width: 320px;
+}
