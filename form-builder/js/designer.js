@@ -94,11 +94,433 @@
         FB.App.toast('发现联动条件循环依赖，请检查', 'error');
         return;
       }
+
+      // Check for previous versions — two-phase publish
+      var versions = FB.storage.getTemplateVersions(this.template.id);
+      if (versions.length === 0) {
+        // First publish — no migration needed
+        this._doPublish();
+        return;
+      }
+
+      var lastVersion = versions[versions.length - 1];
+      var diffReport = FB.migration.diff(lastVersion, this.template);
+
+      if (!FB.migration.hasChanges(diffReport)) {
+        this._doPublish();
+        return;
+      }
+
+      // Has changes — show migration preview
+      this._showMigrationPreview(diffReport, lastVersion);
+    },
+
+    _doPublish: function (migrationRuleSet) {
       this.template.updatedAt = FB.util.now();
-      var published = FB.storage.publishTemplate(this.template);
+      var published = FB.storage.publishTemplate(this.template, migrationRuleSet);
       this.undoManager.markBoundary('publish v' + published.version);
       FB.App.toast('模板已发布 (v' + published.version + ')', 'success');
       FB.App.refreshTemplateSelects();
+    },
+
+    _showMigrationPreview: function (diffReport, oldTemplate) {
+      var self = this;
+      var body = document.createElement('div');
+      body.className = 'migration-preview';
+
+      // Generate default rules
+      var defaultRules = FB.migration.generateDefaultRules(diffReport, oldTemplate, this.template);
+      var currentRules = FB.util.deepClone(defaultRules);
+
+      // Local undo for rule editing
+      var ruleUndoStack = [];
+      var ruleRedoStack = [];
+      var pushRuleUndo = function () {
+        ruleUndoStack.push(FB.util.deepClone(currentRules.rules));
+        ruleRedoStack = [];
+      };
+
+      // === Section 1: Change Summary ===
+      var summarySection = document.createElement('div');
+      summarySection.className = 'migration-section';
+      summarySection.innerHTML = '<h4>变更摘要</h4>';
+      var cards = document.createElement('div');
+      cards.className = 'migration-summary-cards';
+      var categories = [
+        { key: 'added', label: '新增', count: diffReport.added.length },
+        { key: 'deleted', label: '删除', count: diffReport.deleted.length },
+        { key: 'renamed', label: '重命名', count: diffReport.renamed.length },
+        { key: 'typeChanged', label: '类型变更', cls: 'type-changed', count: diffReport.typeChanged.length },
+        { key: 'optionsChanged', label: '选项变更', cls: 'options-changed', count: diffReport.optionsChanged.length },
+        { key: 'conditionsChanged', label: '条件变更', cls: 'conditions-changed', count: diffReport.conditionsChanged.length }
+      ];
+      for (var ci = 0; ci < categories.length; ci++) {
+        if (categories[ci].count > 0) {
+          var card = document.createElement('div');
+          card.className = 'summary-card ' + (categories[ci].cls || categories[ci].key);
+          card.textContent = categories[ci].label + ' ' + categories[ci].count + ' 个字段';
+          cards.appendChild(card);
+        }
+      }
+      summarySection.appendChild(cards);
+      body.appendChild(summarySection);
+
+      // === Section 2: Detailed Changes ===
+      var detailSection = document.createElement('div');
+      detailSection.className = 'migration-section';
+      detailSection.innerHTML = '<h4>详细变更</h4>';
+      detailSection.appendChild(this._renderDiffDetails(diffReport));
+      body.appendChild(detailSection);
+
+      // === Section 3: Data Impact ===
+      var impactSection = document.createElement('div');
+      impactSection.className = 'migration-section';
+      impactSection.innerHTML = '<h4>数据影响预估</h4>';
+      var allData = FB.storage.getFormDataAll(this.template.id);
+      var affectedCount = 0;
+      for (var di = 0; di < allData.length; di++) {
+        if ((allData[di].data._templateVersion || 0) < (oldTemplate.version || 0) + 1) affectedCount++;
+      }
+      var impactInfo = document.createElement('div');
+      impactInfo.innerHTML = '<span class="impact-badge">受影响的历史记录: ' + affectedCount + ' 条</span>';
+      impactSection.appendChild(impactInfo);
+      body.appendChild(impactSection);
+
+      // === Section 4: Migration Rules Editor ===
+      var rulesSection = document.createElement('div');
+      rulesSection.className = 'migration-section';
+      rulesSection.innerHTML = '<h4>迁移映射规则</h4>';
+      var rulesContainer = document.createElement('div');
+      rulesContainer.className = 'migration-rules-editor';
+      rulesSection.appendChild(rulesContainer);
+      body.appendChild(rulesSection);
+
+      var renderRules = function () {
+        self._renderRulesEditor(rulesContainer, currentRules, oldTemplate, function () {
+          pushRuleUndo();
+          renderRules();
+        });
+      };
+      renderRules();
+
+      // Modal keyboard handler for rule undo/redo
+      var keyHandler = function (e) {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+          if (ruleUndoStack.length > 0) {
+            e.preventDefault();
+            ruleRedoStack.push(FB.util.deepClone(currentRules.rules));
+            currentRules.rules = ruleUndoStack.pop();
+            renderRules();
+          }
+        }
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
+          if (ruleRedoStack.length > 0) {
+            e.preventDefault();
+            ruleUndoStack.push(FB.util.deepClone(currentRules.rules));
+            currentRules.rules = ruleRedoStack.pop();
+            renderRules();
+          }
+        }
+      };
+      document.addEventListener('keydown', keyHandler);
+
+      FB.App.showModal('发布影响评估 (v' + oldTemplate.version + ' → v' + (oldTemplate.version + 1) + ')', body, [
+        {
+          label: '发布并应用迁移规则',
+          cls: 'btn-primary',
+          action: function () {
+            document.removeEventListener('keydown', keyHandler);
+            self._executePublishWithMigration(currentRules, oldTemplate);
+          }
+        },
+        {
+          label: '发布不迁移',
+          cls: 'btn-secondary',
+          action: function () {
+            document.removeEventListener('keydown', keyHandler);
+            FB.App.hideModal();
+            self._doPublish();
+          }
+        },
+        {
+          label: '取消',
+          cls: 'btn-secondary',
+          action: function () {
+            document.removeEventListener('keydown', keyHandler);
+            FB.App.hideModal();
+          }
+        }
+      ]);
+    },
+
+    _renderDiffDetails: function (diffReport) {
+      var container = document.createElement('div');
+      var sections = [
+        { key: 'added', title: '新增字段', items: diffReport.added, render: function (item) { return item.field.label + ' (' + item.field.type + ')'; } },
+        { key: 'deleted', title: '删除字段', items: diffReport.deleted, render: function (item) { return item.field.label + ' (' + item.field.type + ')'; } },
+        { key: 'renamed', title: '重命名', items: diffReport.renamed, render: function (item) { return item.oldLabel + ' → ' + item.newLabel; } },
+        { key: 'typeChanged', title: '类型变更', items: diffReport.typeChanged, render: function (item) { return item.label + ': ' + item.oldType + ' → ' + item.newType; } },
+        { key: 'optionsChanged', title: '选项变更', items: diffReport.optionsChanged, render: function (item) {
+          var parts = [];
+          if (item.addedOpts.length) parts.push('+' + item.addedOpts.length + '项');
+          if (item.removedOpts.length) parts.push('-' + item.removedOpts.length + '项');
+          if (item.renamedOpts.length) parts.push('改名' + item.renamedOpts.length + '项');
+          return item.label + ': ' + parts.join(', ');
+        }},
+        { key: 'conditionsChanged', title: '条件变更', items: diffReport.conditionsChanged, render: function (item) {
+          return item.label + ': ' + item.oldConditions.length + '条 → ' + item.newConditions.length + '条';
+        }}
+      ];
+
+      for (var si = 0; si < sections.length; si++) {
+        var sec = sections[si];
+        if (sec.items.length === 0) continue;
+
+        var group = document.createElement('div');
+        group.className = 'change-detail-group';
+
+        var header = document.createElement('div');
+        header.className = 'change-detail-header';
+        header.innerHTML = '<span>▶</span> ' + sec.title + ' (' + sec.items.length + ')';
+        group.appendChild(header);
+
+        var body = document.createElement('div');
+        body.className = 'change-detail-body';
+        body.style.display = 'none';
+        for (var ii = 0; ii < sec.items.length; ii++) {
+          var item = document.createElement('div');
+          item.className = 'change-detail-item';
+          item.textContent = sec.render(sec.items[ii]);
+          body.appendChild(item);
+        }
+        group.appendChild(body);
+
+        (function (h, b) {
+          h.addEventListener('click', function () {
+            var open = b.style.display !== 'none';
+            b.style.display = open ? 'none' : 'block';
+            h.querySelector('span').textContent = open ? '▶' : '▼';
+          });
+        })(header, body);
+
+        container.appendChild(group);
+      }
+      return container;
+    },
+
+    _renderRulesEditor: function (container, ruleSet, oldTemplate, onChanged) {
+      var self = this;
+      container.innerHTML = '';
+      var rules = ruleSet.rules || [];
+
+      if (rules.length === 0) {
+        container.innerHTML = '<div style="color:#999;font-size:12px;padding:8px;">无迁移规则</div>';
+      }
+
+      for (var i = 0; i < rules.length; i++) {
+        (function (idx) {
+          var rule = rules[idx];
+          var row = document.createElement('div');
+          row.className = 'migration-rule-row';
+
+          var badge = document.createElement('span');
+          badge.className = 'rule-type-badge ' + self._getRuleTypeBadgeCls(rule.type);
+          badge.textContent = self._getRuleTypeLabel(rule.type);
+          row.appendChild(badge);
+
+          var desc = document.createElement('span');
+          desc.className = 'rule-desc';
+          desc.textContent = self._getRuleDescription(rule, oldTemplate);
+          row.appendChild(desc);
+
+          var removeBtn = document.createElement('button');
+          removeBtn.className = 'btn-remove-option btn-remove-rule';
+          removeBtn.textContent = '✕';
+          removeBtn.addEventListener('click', function () {
+            rules.splice(idx, 1);
+            onChanged();
+          });
+          row.appendChild(removeBtn);
+
+          container.appendChild(row);
+        })(i);
+      }
+
+      // Add rule button
+      var addBtn = document.createElement('button');
+      addBtn.className = 'btn-add-rule';
+      addBtn.textContent = '+ 添加规则';
+      addBtn.addEventListener('click', function () {
+        self._showAddRuleForm(container, ruleSet, oldTemplate, onChanged);
+      });
+      container.appendChild(addBtn);
+    },
+
+    _showAddRuleForm: function (container, ruleSet, oldTemplate, onChanged) {
+      var existing = container.querySelector('.add-rule-form');
+      if (existing) { existing.remove(); return; }
+
+      var self = this;
+      var form = document.createElement('div');
+      form.className = 'add-rule-form';
+
+      // Build field options from old and new template
+      var oldFields = [];
+      var newFields = [];
+      var collectFields = function (fields, arr) {
+        for (var i = 0; i < fields.length; i++) {
+          var f = fields[i];
+          if (!f._deleted && f.type !== 'group') arr.push(f);
+          if (f.type === 'group' && f.children) collectFields(f.children, arr);
+        }
+      };
+      collectFields(oldTemplate.fields, oldFields);
+      collectFields(this.template.fields, newFields);
+
+      var typeSelect = document.createElement('select');
+      var types = [
+        ['fieldMap', '字段映射'], ['merge', '字段合并'], ['enumRename', '枚举重命名'],
+        ['preserveAttachment', '附件保留'], ['softDelete', '软删除']
+      ];
+      for (var ti = 0; ti < types.length; ti++) {
+        var opt = document.createElement('option');
+        opt.value = types[ti][0];
+        opt.textContent = types[ti][1];
+        typeSelect.appendChild(opt);
+      }
+      form.appendChild(typeSelect);
+
+      var paramsDiv = document.createElement('div');
+      paramsDiv.style.cssText = 'margin-top:6px;';
+      form.appendChild(paramsDiv);
+
+      var renderParams = function () {
+        paramsDiv.innerHTML = '';
+        var type = typeSelect.value;
+
+        if (type === 'fieldMap') {
+          paramsDiv.innerHTML =
+            '<label style="font-size:11px;">源字段:</label> ' +
+            '<select data-param="source">' + oldFields.map(function (f) { return '<option value="' + f.id + '">' + FB.util.escapeHtml(f.label) + '</option>'; }).join('') + '</select> ' +
+            '<label style="font-size:11px;">目标字段:</label> ' +
+            '<select data-param="target">' + newFields.map(function (f) { return '<option value="' + f.id + '">' + FB.util.escapeHtml(f.label) + '</option>'; }).join('') + '</select> ' +
+            '<label style="font-size:11px;">转换:</label> ' +
+            '<select data-param="transform"><option value="">无</option><option value="toString">转文本</option><option value="toNumber">转数字</option></select>';
+        } else if (type === 'merge') {
+          paramsDiv.innerHTML =
+            '<label style="font-size:11px;">源字段(多选):</label><br>' +
+            oldFields.map(function (f) {
+              return '<label style="font-size:11px;margin-right:8px;"><input type="checkbox" data-merge-source value="' + f.id + '"> ' + FB.util.escapeHtml(f.label) + '</label>';
+            }).join('') +
+            '<br><label style="font-size:11px;">目标字段:</label> ' +
+            '<select data-param="target">' + newFields.map(function (f) { return '<option value="' + f.id + '">' + FB.util.escapeHtml(f.label) + '</option>'; }).join('') + '</select> ' +
+            '<label style="font-size:11px;">分隔符:</label> <input data-param="separator" value="; " style="width:40px;">';
+        } else if (type === 'enumRename') {
+          var enumFields = oldFields.filter(function (f) { return f.type === 'radio' || f.type === 'checkbox'; });
+          paramsDiv.innerHTML =
+            '<label style="font-size:11px;">字段:</label> ' +
+            '<select data-param="fieldId">' + enumFields.map(function (f) { return '<option value="' + f.id + '">' + FB.util.escapeHtml(f.label) + '</option>'; }).join('') + '</select>' +
+            '<div data-mapping-area style="margin-top:4px;"></div>';
+        } else if (type === 'preserveAttachment' || type === 'softDelete') {
+          paramsDiv.innerHTML =
+            '<label style="font-size:11px;">字段:</label> ' +
+            '<select data-param="fieldId">' + oldFields.map(function (f) { return '<option value="' + f.id + '">' + FB.util.escapeHtml(f.label) + '</option>'; }).join('') + '</select>';
+        }
+      };
+      typeSelect.addEventListener('change', renderParams);
+      renderParams();
+
+      var confirmBtn = document.createElement('button');
+      confirmBtn.className = 'btn btn-primary';
+      confirmBtn.style.cssText = 'margin-top:6px;font-size:12px;';
+      confirmBtn.textContent = '添加';
+      confirmBtn.addEventListener('click', function () {
+        var type = typeSelect.value;
+        var newRule = { type: type };
+
+        if (type === 'fieldMap') {
+          newRule.sourceField = paramsDiv.querySelector('[data-param="source"]').value;
+          newRule.targetField = paramsDiv.querySelector('[data-param="target"]').value;
+          newRule.transform = paramsDiv.querySelector('[data-param="transform"]').value || null;
+        } else if (type === 'merge') {
+          var checked = paramsDiv.querySelectorAll('[data-merge-source]:checked');
+          newRule.sourceFields = [];
+          for (var ci = 0; ci < checked.length; ci++) newRule.sourceFields.push(checked[ci].value);
+          newRule.targetField = paramsDiv.querySelector('[data-param="target"]').value;
+          newRule.separator = paramsDiv.querySelector('[data-param="separator"]').value || '; ';
+        } else if (type === 'enumRename') {
+          newRule.fieldId = paramsDiv.querySelector('[data-param="fieldId"]').value;
+          newRule.mappings = [];
+        } else if (type === 'preserveAttachment' || type === 'softDelete') {
+          newRule.fieldId = paramsDiv.querySelector('[data-param="fieldId"]').value;
+          if (type === 'softDelete') newRule.reason = '手动添加';
+        }
+
+        ruleSet.rules.push(newRule);
+        onChanged();
+      });
+      form.appendChild(confirmBtn);
+
+      var cancelBtn = document.createElement('button');
+      cancelBtn.className = 'btn btn-secondary';
+      cancelBtn.style.cssText = 'margin-top:6px;margin-left:4px;font-size:12px;';
+      cancelBtn.textContent = '取消';
+      cancelBtn.addEventListener('click', function () { form.remove(); });
+      form.appendChild(cancelBtn);
+
+      // Insert before the add button
+      var addBtnEl = container.querySelector('.btn-add-rule');
+      container.insertBefore(form, addBtnEl);
+    },
+
+    _getRuleTypeBadgeCls: function (type) {
+      var map = { fieldMap: 'map', merge: 'merge', enumRename: 'enum', preserveAttachment: 'attach', softDelete: 'softdel' };
+      return map[type] || '';
+    },
+
+    _getRuleTypeLabel: function (type) {
+      var map = { fieldMap: '映射', merge: '合并', enumRename: '枚举', preserveAttachment: '附件', softDelete: '软删' };
+      return map[type] || type;
+    },
+
+    _getRuleDescription: function (rule, oldTemplate) {
+      var findLabel = function (fields, id) {
+        for (var i = 0; i < fields.length; i++) {
+          if (fields[i].id === id) return fields[i].label;
+          if (fields[i].children) { var r = findLabel(fields[i].children, id); if (r) return r; }
+          if (fields[i].subFields) { var s = findLabel(fields[i].subFields, id); if (s) return s; }
+        }
+        return id ? id.slice(0, 8) + '...' : '?';
+      };
+      var oldFields = oldTemplate.fields;
+      var newFields = this.template.fields;
+
+      switch (rule.type) {
+        case 'fieldMap':
+          return findLabel(oldFields, rule.sourceField) + ' → ' + findLabel(newFields, rule.targetField) +
+            (rule.transform ? ' (' + rule.transform + ')' : '');
+        case 'merge':
+          return (rule.sourceFields || []).map(function (id) { return findLabel(oldFields, id); }).join(' + ') +
+            ' → ' + findLabel(newFields, rule.targetField);
+        case 'enumRename':
+          return findLabel(oldFields, rule.fieldId) + ': ' + (rule.mappings || []).length + ' 项映射';
+        case 'preserveAttachment':
+          return '保留附件: ' + findLabel(oldFields, rule.fieldId);
+        case 'softDelete':
+          return '软删除: ' + findLabel(oldFields, rule.fieldId);
+        default:
+          return rule.type;
+      }
+    },
+
+    _executePublishWithMigration: function (ruleSet, oldTemplate) {
+      var validation = FB.migration.validateRules(ruleSet, oldTemplate, this.template);
+      if (!validation.valid) {
+        FB.App.toast('规则校验失败: ' + validation.errors[0], 'error');
+        return;
+      }
+      FB.App.hideModal();
+      this._doPublish(ruleSet);
     },
 
     _undo: function () {

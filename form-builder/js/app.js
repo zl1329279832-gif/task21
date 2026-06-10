@@ -156,7 +156,7 @@
 
       $('#btn-save-draft-fill').disabled = false;
       $('#btn-submit-fill').disabled = false;
-      var versionInfo = tpl.version ? ' (v' + tpl.version + ')' : '';
+      var versionInfo = template.version ? ' (v' + template.version + ')' : '';
       $('#fill-status').textContent = '填报中...' + versionInfo;
 
       if (this._autoSaveTimer) clearInterval(this._autoSaveTimer);
@@ -279,7 +279,8 @@
       actions.style.cssText = 'margin-top:16px;display:flex;gap:8px;';
       actions.innerHTML =
         '<button class="btn btn-primary" id="btn-load-version-edit">加载到设计器</button>' +
-        '<button class="btn btn-secondary" id="btn-export-version">导出此版本</button>';
+        '<button class="btn btn-secondary" id="btn-export-version">导出此版本</button>' +
+        '<button class="btn btn-secondary" id="btn-migrate-version-data">迁移数据到最新版</button>';
       detail.appendChild(actions);
 
       $('#btn-load-version-edit').addEventListener('click', function () {
@@ -292,6 +293,41 @@
         var json = FB.io.exportTemplate(version);
         FB.io.downloadFile(json, version.name + '_v' + version.version + '.json', 'application/json');
         self.toast('版本已导出', 'success');
+      });
+
+      $('#btn-migrate-version-data').addEventListener('click', function () {
+        var latestTpl = FB.storage.getTemplateLatest(templateId);
+        if (!latestTpl || latestTpl.version === version.version) {
+          self.toast('已是最新版本，无需迁移', 'info');
+          return;
+        }
+        var allData = FB.storage.getFormDataAll(templateId);
+        var targetData = allData.filter(function (r) { return r.data._templateVersion === version.version; });
+        if (targetData.length === 0) {
+          self.toast('该版本没有填报数据', 'info');
+          return;
+        }
+        var successCount = 0;
+        var failCount = 0;
+        var failures = [];
+        for (var mi = 0; mi < targetData.length; mi++) {
+          var result = FB.migration.migrateData(templateId, targetData[mi].data, latestTpl.version);
+          if (result.success) {
+            successCount++;
+          } else {
+            failCount++;
+            failures.push(targetData[mi].recordId.slice(0, 8) + ': ' + result.error);
+          }
+        }
+        var summaryBody = document.createElement('div');
+        summaryBody.innerHTML =
+          '<p>成功: <strong style="color:var(--success);">' + successCount + '</strong> 条</p>' +
+          '<p>失败: <strong style="color:var(--danger);">' + failCount + '</strong> 条</p>' +
+          (failures.length > 0 ? '<div style="margin-top:8px;font-size:12px;color:var(--danger);">' +
+            failures.map(function (f) { return '<div>' + FB.util.escapeHtml(f) + '</div>'; }).join('') + '</div>' : '');
+        self.showModal('迁移结果 (v' + version.version + ' → v' + latestTpl.version + ')', summaryBody, [
+          { label: '关闭', cls: 'btn-secondary', action: function () { self.hideModal(); } }
+        ]);
       });
     },
 
@@ -344,16 +380,27 @@
         if (!tplId || !recId) { self.toast('请选择模板和记录', 'error'); return; }
         var rec = FB.storage.getFormData(tplId, recId);
         if (!rec) { self.toast('数据不存在', 'error'); return; }
-        // Use the version the data was created against
-        var tpl = (rec.data._templateVersion) ?
-          (FB.storage.getTemplateVersion(tplId, rec.data._templateVersion) || FB.storage.getTemplateLatest(tplId)) :
-          FB.storage.getTemplateLatest(tplId);
-        if (!tpl) { self.toast('模板不存在', 'error'); return; }
 
-        var json = FB.io.exportData(tpl, rec.data);
-        $('#export-data-output').textContent = json;
-        FB.io.downloadFile(json, 'form_data_' + recId.slice(0, 8) + '.json', 'application/json');
-        self.toast('数据已导出', 'success');
+        var viewMode = $('#export-data-view').value;
+        if (viewMode === 'migrated') {
+          var latestTpl = FB.storage.getTemplateLatest(tplId);
+          if (!latestTpl) { self.toast('模板不存在', 'error'); return; }
+          var migrateResult = FB.migration.migrateData(tplId, rec.data, latestTpl.version);
+          if (migrateResult.success) {
+            var json = FB.io.exportDataMigrated(latestTpl, migrateResult.data, {
+              originalVersion: rec.data._templateVersion,
+              migratedTo: latestTpl.version
+            });
+            $('#export-data-output').textContent = json;
+            FB.io.downloadFile(json, 'form_data_migrated_' + recId.slice(0, 8) + '.json', 'application/json');
+            self.toast('数据已导出（迁移视图）', 'success');
+          } else {
+            self.toast('迁移失败: ' + migrateResult.error + '，回退到原始视图', 'error');
+            self._exportDataOriginal(tplId, recId, rec, 'json');
+          }
+        } else {
+          self._exportDataOriginal(tplId, recId, rec, 'json');
+        }
       });
 
       $('#btn-export-data-csv').addEventListener('click', function () {
@@ -362,17 +409,44 @@
         if (!tplId || !recId) { self.toast('请选择模板和记录', 'error'); return; }
         var rec = FB.storage.getFormData(tplId, recId);
         if (!rec) { self.toast('数据不存在', 'error'); return; }
-        // Use the version the data was created against
-        var tpl = (rec.data._templateVersion) ?
-          (FB.storage.getTemplateVersion(tplId, rec.data._templateVersion) || FB.storage.getTemplateLatest(tplId)) :
-          FB.storage.getTemplateLatest(tplId);
-        if (!tpl) { self.toast('模板不存在', 'error'); return; }
 
+        var viewMode = $('#export-data-view').value;
+        if (viewMode === 'migrated') {
+          var latestTpl = FB.storage.getTemplateLatest(tplId);
+          if (!latestTpl) { self.toast('模板不存在', 'error'); return; }
+          var migrateResult = FB.migration.migrateData(tplId, rec.data, latestTpl.version);
+          if (migrateResult.success) {
+            var csv = FB.io.exportDataCSV(latestTpl, migrateResult.data);
+            $('#export-data-output').textContent = csv;
+            FB.io.downloadFile(csv, 'form_data_migrated_' + recId.slice(0, 8) + '.csv', 'text/csv');
+            self.toast('CSV 已导出（迁移视图）', 'success');
+          } else {
+            self.toast('迁移失败: ' + migrateResult.error + '，回退到原始视图', 'error');
+            self._exportDataOriginal(tplId, recId, rec, 'csv');
+          }
+        } else {
+          self._exportDataOriginal(tplId, recId, rec, 'csv');
+        }
+      });
+    },
+
+    _exportDataOriginal: function (tplId, recId, rec, format) {
+      var tpl = (rec.data._templateVersion) ?
+        (FB.storage.getTemplateVersion(tplId, rec.data._templateVersion) || FB.storage.getTemplateLatest(tplId)) :
+        FB.storage.getTemplateLatest(tplId);
+      if (!tpl) { this.toast('模板不存在', 'error'); return; }
+
+      if (format === 'csv') {
         var csv = FB.io.exportDataCSV(tpl, rec.data);
         $('#export-data-output').textContent = csv;
         FB.io.downloadFile(csv, 'form_data_' + recId.slice(0, 8) + '.csv', 'text/csv');
-        self.toast('CSV 已导出', 'success');
-      });
+        this.toast('CSV 已导出', 'success');
+      } else {
+        var json = FB.io.exportData(tpl, rec.data);
+        $('#export-data-output').textContent = json;
+        FB.io.downloadFile(json, 'form_data_' + recId.slice(0, 8) + '.json', 'application/json');
+        this.toast('数据已导出', 'success');
+      }
     },
 
     _importTemplate: function (jsonText) {
@@ -414,6 +488,16 @@
         this._ensureFieldIds(tpl.fields);
         FB.storage.saveTemplateDraft(tpl);
         var published = FB.storage.publishTemplate(tpl);
+
+        // Restore embedded migration rules
+        if (data._migrationRules && Array.isArray(data._migrationRules)) {
+          for (var mri = 0; mri < data._migrationRules.length; mri++) {
+            var mr = data._migrationRules[mri];
+            if (mr.fromVersion && mr.toVersion) {
+              FB.storage.saveMigrationRules(tpl.id, mr.fromVersion, mr.toVersion, mr);
+            }
+          }
+        }
 
         var warnings = '';
         if (tpl._originalVersion && existingEntry && tpl._originalVersion < existingEntry.version) {

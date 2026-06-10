@@ -149,6 +149,13 @@
           <select id="export-data-record" class="input-select">
             <option value="">-- 选择记录 --</option>
           </select>
+          <div style="margin:8px 0;">
+            <label style="font-size:12px;color:#666;">导出视图模式:</label>
+            <select id="export-data-view" class="input-select" style="margin-left:4px;width:auto;">
+              <option value="original">原始版本视图</option>
+              <option value="migrated">迁移到最新版本视图</option>
+            </select>
+          </div>
           <button id="btn-export-data-json" class="btn btn-primary">导出 JSON</button>
           <button id="btn-export-data-csv" class="btn btn-secondary">导出 CSV</button>
           <pre id="export-data-output" class="output-box"></pre>

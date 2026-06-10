@@ -103,7 +103,7 @@
     // Template operations
     saveTemplateDraft: function (tpl) { this.set('draft_' + tpl.id, tpl); },
     getTemplateDraft: function (id) { return this.get('draft_' + id); },
-    publishTemplate: function (tpl) {
+    publishTemplate: function (tpl, migrationRuleSet) {
       var versions = this.get('versions_' + tpl.id) || [];
       tpl.version = versions.length + 1;
       tpl.publishedAt = FB.util.now();
@@ -119,6 +119,10 @@
       var entry = { id: tpl.id, name: tpl.name, version: tpl.version, publishedAt: tpl.publishedAt };
       if (idx >= 0) index[idx] = entry; else index.push(entry);
       this.set('template_index', index);
+      // Save migration rules if provided (version >= 2)
+      if (migrationRuleSet && tpl.version >= 2) {
+        this.saveMigrationRules(tpl.id, tpl.version - 1, tpl.version, migrationRuleSet);
+      }
       return tpl;
     },
     getTemplateLatest: function (id) { return this.get('latest_' + id); },
@@ -174,6 +178,30 @@
         if (all[i].recordId !== recordId) filtered.push(all[i]);
       }
       this.set('data_' + templateId, filtered);
+    },
+    // Migration rule storage
+    saveMigrationRules: function (tplId, fromVer, toVer, ruleSet) {
+      var key = 'migration_' + tplId + '_' + fromVer + '_' + toVer;
+      ruleSet.templateId = tplId;
+      ruleSet.fromVersion = fromVer;
+      ruleSet.toVersion = toVer;
+      if (!ruleSet.createdAt) ruleSet.createdAt = FB.util.now();
+      this.set(key, ruleSet);
+    },
+    getMigrationRules: function (tplId, fromVer, toVer) {
+      return this.get('migration_' + tplId + '_' + fromVer + '_' + toVer);
+    },
+    getAllMigrationRules: function (tplId) {
+      var prefix = 'migration_' + tplId + '_';
+      var allKeys = this.keys();
+      var result = [];
+      for (var i = 0; i < allKeys.length; i++) {
+        if (allKeys[i].indexOf(prefix) === 0) {
+          var rs = this.get(allKeys[i]);
+          if (rs) result.push(rs);
+        }
+      }
+      return result;
     }
   };
 
@@ -579,14 +607,48 @@
           }
         }
       }
+      // Validate embedded migration rules if present
+      if (data._migrationRules) {
+        if (!Array.isArray(data._migrationRules)) {
+          errors.push('_migrationRules 必须是数组');
+        } else {
+          for (var mi = 0; mi < data._migrationRules.length; mi++) {
+            var mr = data._migrationRules[mi];
+            if (!mr.fromVersion || !mr.toVersion) {
+              errors.push('迁移规则 [' + mi + '] 缺少 fromVersion 或 toVersion');
+            }
+            if (!mr.rules || !Array.isArray(mr.rules)) {
+              errors.push('迁移规则 [' + mi + '] 缺少 rules 数组');
+            }
+          }
+        }
+      }
       return { valid: errors.length === 0, errors: errors, template: errors.length === 0 ? data : null };
+    },
+
+    exportDataMigrated: function (template, data, migrationMeta) {
+      return JSON.stringify({
+        _system: 'gov-form-builder',
+        _exportVersion: 2,
+        templateId: template.id,
+        templateName: template.name,
+        templateVersion: template.version,
+        data: data,
+        exportedAt: FB.util.now(),
+        _migration: migrationMeta || null
+      }, null, 2);
     },
 
     exportTemplate: function (template) {
       var clone = FB.util.deepClone(template);
       clone._exportedAt = FB.util.now();
       clone._system = 'gov-form-builder';
-      clone._exportVersion = 1;
+      clone._exportVersion = 2;
+      // Include migration rules if any
+      var allRules = FB.storage.getAllMigrationRules(template.id);
+      if (allRules.length > 0) {
+        clone._migrationRules = allRules;
+      }
       return JSON.stringify(clone, null, 2);
     },
 
@@ -715,7 +777,440 @@
   };
 
   /* =========================================================
-     8. Version Compatibility
+     7.5 Migration - Cross-version diff, rules, migration chain
+     ========================================================= */
+  FB.migration = {
+    /**
+     * Build a flat index of all fields (including group children and table subFields).
+     * Returns { id: { field, index, parentId, isSubField } }
+     */
+    _buildFieldIndex: function (fields, parentId, result, counter) {
+      if (!result) result = {};
+      if (!counter) counter = { n: 0 };
+      for (var i = 0; i < fields.length; i++) {
+        var f = fields[i];
+        result[f.id] = { field: f, index: counter.n++, parentId: parentId || null, isSubField: false };
+        if (f.type === 'table' && f.subFields) {
+          for (var j = 0; j < f.subFields.length; j++) {
+            var sf = f.subFields[j];
+            result[sf.id] = { field: sf, index: counter.n++, parentId: f.id, isSubField: true };
+          }
+        }
+        if (f.type === 'group' && f.children) {
+          this._buildFieldIndex(f.children, f.id, result, counter);
+        }
+      }
+      return result;
+    },
+
+    /** Compare two option arrays by value key. Returns { added, removed, renamed } */
+    _diffOptions: function (oldOpts, newOpts) {
+      oldOpts = oldOpts || [];
+      newOpts = newOpts || [];
+      var oldMap = {};
+      for (var i = 0; i < oldOpts.length; i++) oldMap[oldOpts[i].value] = oldOpts[i];
+      var newMap = {};
+      for (var j = 0; j < newOpts.length; j++) newMap[newOpts[j].value] = newOpts[j];
+
+      var added = [];
+      var removed = [];
+      var renamed = [];
+      for (var nk in newMap) {
+        if (!oldMap[nk]) added.push(newMap[nk]);
+        else if (oldMap[nk].label !== newMap[nk].label) {
+          renamed.push({ value: nk, oldLabel: oldMap[nk].label, newLabel: newMap[nk].label });
+        }
+      }
+      for (var ok in oldMap) {
+        if (!newMap[ok]) removed.push(oldMap[ok]);
+      }
+      return { added: added, removed: removed, renamed: renamed };
+    },
+
+    /** Deep compare two condition arrays */
+    _diffConditions: function (oldConds, newConds) {
+      return JSON.stringify(oldConds || []) !== JSON.stringify(newConds || []);
+    },
+
+    /**
+     * Compare two template versions and produce a DiffReport.
+     */
+    diff: function (oldTpl, newTpl) {
+      var oldIdx = this._buildFieldIndex(oldTpl.fields);
+      var newIdx = this._buildFieldIndex(newTpl.fields);
+
+      var report = {
+        added: [],
+        deleted: [],
+        renamed: [],
+        typeChanged: [],
+        optionsChanged: [],
+        conditionsChanged: [],
+        reordered: []
+      };
+
+      // Detect added, renamed, typeChanged, optionsChanged, conditionsChanged
+      for (var nId in newIdx) {
+        var ne = newIdx[nId];
+        if (!oldIdx[nId]) {
+          // New field (only if not soft-deleted)
+          if (!ne.field._deleted) {
+            report.added.push({ field: ne.field });
+          }
+        } else {
+          var oe = oldIdx[nId];
+          var of_ = oe.field;
+          var nf = ne.field;
+
+          // Deletion state changed
+          if (!of_._deleted && nf._deleted) {
+            report.deleted.push({ field: nf });
+            continue;
+          }
+          if (of_._deleted && !nf._deleted) {
+            report.added.push({ field: nf });
+            continue;
+          }
+          if (nf._deleted) continue;
+
+          // Rename
+          if (of_.label !== nf.label) {
+            report.renamed.push({ fieldId: nf.id, oldLabel: of_.label, newLabel: nf.label });
+          }
+          // Type change
+          if (of_.type !== nf.type) {
+            report.typeChanged.push({ fieldId: nf.id, label: nf.label, oldType: of_.type, newType: nf.type });
+          }
+          // Options change (radio/checkbox)
+          if ((nf.type === 'radio' || nf.type === 'checkbox') && of_.type === nf.type) {
+            var optDiff = this._diffOptions(of_.options, nf.options);
+            if (optDiff.added.length > 0 || optDiff.removed.length > 0 || optDiff.renamed.length > 0) {
+              report.optionsChanged.push({
+                fieldId: nf.id,
+                label: nf.label,
+                addedOpts: optDiff.added,
+                removedOpts: optDiff.removed,
+                renamedOpts: optDiff.renamed
+              });
+            }
+          }
+          // Conditions change
+          if (this._diffConditions(of_.conditions, nf.conditions)) {
+            report.conditionsChanged.push({
+              fieldId: nf.id,
+              label: nf.label,
+              oldConditions: of_.conditions || [],
+              newConditions: nf.conditions || []
+            });
+          }
+          // Reorder (only for non-subfields at same parent level)
+          if (!ne.isSubField && !oe.isSubField && oe.index !== ne.index) {
+            report.reordered.push({
+              fieldId: nf.id,
+              label: nf.label,
+              oldIndex: oe.index,
+              newIndex: ne.index
+            });
+          }
+        }
+      }
+
+      // Detect deleted (in old but not in new)
+      for (var oId in oldIdx) {
+        if (!newIdx[oId] && !oldIdx[oId].field._deleted) {
+          report.deleted.push({ field: oldIdx[oId].field });
+        }
+      }
+
+      return report;
+    },
+
+    /** Check if a diff report has any changes */
+    hasChanges: function (report) {
+      return report.added.length > 0 || report.deleted.length > 0 ||
+        report.renamed.length > 0 || report.typeChanged.length > 0 ||
+        report.optionsChanged.length > 0 || report.conditionsChanged.length > 0 ||
+        report.reordered.length > 0;
+    },
+
+    /**
+     * Auto-generate default migration rules from a diff report.
+     */
+    generateDefaultRules: function (diffReport, oldTpl, newTpl) {
+      var rules = [];
+
+      // Deleted fields -> softDelete or preserveAttachment
+      for (var i = 0; i < diffReport.deleted.length; i++) {
+        var df = diffReport.deleted[i].field;
+        if (df.type === 'attachment') {
+          rules.push({ type: 'preserveAttachment', fieldId: df.id });
+        } else {
+          rules.push({ type: 'softDelete', fieldId: df.id, reason: '字段已删除' });
+        }
+      }
+
+      // Options renamed -> enumRename
+      for (var j = 0; j < diffReport.optionsChanged.length; j++) {
+        var oc = diffReport.optionsChanged[j];
+        if (oc.renamedOpts.length > 0) {
+          var mappings = [];
+          for (var k = 0; k < oc.renamedOpts.length; k++) {
+            mappings.push({ oldValue: oc.renamedOpts[k].value, newValue: oc.renamedOpts[k].value });
+          }
+          rules.push({ type: 'enumRename', fieldId: oc.fieldId, mappings: mappings });
+        }
+      }
+
+      // Type changed -> fieldMap with transform
+      for (var m = 0; m < diffReport.typeChanged.length; m++) {
+        var tc = diffReport.typeChanged[m];
+        var transform = null;
+        if (tc.oldType === 'number' && tc.newType === 'text') transform = 'toString';
+        else if (tc.oldType === 'text' && tc.newType === 'number') transform = 'toNumber';
+        rules.push({
+          type: 'fieldMap',
+          sourceField: tc.fieldId,
+          targetField: tc.fieldId,
+          transform: transform
+        });
+      }
+
+      return {
+        templateId: newTpl.id,
+        fromVersion: oldTpl.version,
+        toVersion: newTpl.version || 0,
+        createdAt: FB.util.now(),
+        rules: rules
+      };
+    },
+
+    /**
+     * Apply migration rules to transform old data to new schema.
+     * Returns { success: true, data } or { success: false, error, originalData }
+     */
+    applyRules: function (ruleSet, oldData, newTemplate) {
+      try {
+        var data = FB.util.deepClone(oldData);
+        var rules = ruleSet.rules || [];
+
+        for (var i = 0; i < rules.length; i++) {
+          var rule = rules[i];
+          switch (rule.type) {
+            case 'fieldMap':
+              if (data[rule.sourceField] !== undefined) {
+                var val = data[rule.sourceField];
+                if (rule.transform === 'toString') val = String(val);
+                else if (rule.transform === 'toNumber') val = Number(val) || 0;
+                data[rule.targetField] = val;
+                if (rule.sourceField !== rule.targetField) {
+                  delete data[rule.sourceField];
+                }
+              }
+              break;
+
+            case 'merge':
+              var parts = [];
+              var sources = rule.sourceFields || [];
+              for (var si = 0; si < sources.length; si++) {
+                if (data[sources[si]] !== undefined && data[sources[si]] !== '') {
+                  parts.push(String(data[sources[si]]));
+                }
+                delete data[sources[si]];
+              }
+              data[rule.targetField] = parts.join(rule.separator || '; ');
+              break;
+
+            case 'enumRename':
+              if (data[rule.fieldId] !== undefined && rule.mappings) {
+                var mapLookup = {};
+                for (var mi = 0; mi < rule.mappings.length; mi++) {
+                  mapLookup[rule.mappings[mi].oldValue] = rule.mappings[mi].newValue;
+                }
+                if (Array.isArray(data[rule.fieldId])) {
+                  // Checkbox (array)
+                  for (var ai = 0; ai < data[rule.fieldId].length; ai++) {
+                    if (mapLookup[data[rule.fieldId][ai]] !== undefined) {
+                      data[rule.fieldId][ai] = mapLookup[data[rule.fieldId][ai]];
+                    }
+                  }
+                } else {
+                  // Radio (scalar)
+                  if (mapLookup[data[rule.fieldId]] !== undefined) {
+                    data[rule.fieldId] = mapLookup[data[rule.fieldId]];
+                  }
+                }
+              }
+              break;
+
+            case 'preserveAttachment':
+              // Keep the value as-is; just ensure it's carried over
+              break;
+
+            case 'softDelete':
+              if (data[rule.fieldId] !== undefined) {
+                if (!data._archivedFields) data._archivedFields = {};
+                data._archivedFields[rule.fieldId] = {
+                  value: data[rule.fieldId],
+                  reason: rule.reason || '',
+                  archivedAt: FB.util.now()
+                };
+              }
+              break;
+          }
+        }
+
+        // Fill defaults for new fields
+        data = FB.compatibility.mergeDataWithTemplate(newTemplate, data);
+        data._templateVersion = newTemplate.version;
+
+        // Preserve metadata from original
+        for (var key in oldData) {
+          if (key.charAt(0) === '_' && key !== '_templateVersion' && data[key] === undefined) {
+            data[key] = oldData[key];
+          }
+        }
+
+        return { success: true, data: data };
+      } catch (e) {
+        return { success: false, error: e.message || String(e), originalData: oldData };
+      }
+    },
+
+    /**
+     * Validate that a rule set is internally consistent.
+     */
+    validateRules: function (ruleSet, oldTpl, newTpl) {
+      var errors = [];
+      var rules = ruleSet.rules || [];
+      var oldIdx = this._buildFieldIndex(oldTpl.fields);
+      var newIdx = this._buildFieldIndex(newTpl.fields);
+      var targetFields = {};
+
+      for (var i = 0; i < rules.length; i++) {
+        var rule = rules[i];
+        switch (rule.type) {
+          case 'fieldMap':
+            if (rule.sourceField && !oldIdx[rule.sourceField]) {
+              errors.push('规则 ' + (i + 1) + ': 源字段 "' + rule.sourceField + '" 不存在于旧模板');
+            }
+            if (rule.targetField && !newIdx[rule.targetField]) {
+              errors.push('规则 ' + (i + 1) + ': 目标字段 "' + rule.targetField + '" 不存在于新模板');
+            }
+            if (rule.targetField) {
+              if (targetFields[rule.targetField]) {
+                errors.push('规则 ' + (i + 1) + ': 目标字段 "' + rule.targetField + '" 已被其他规则映射');
+              }
+              targetFields[rule.targetField] = true;
+            }
+            break;
+
+          case 'merge':
+            var sources = rule.sourceFields || [];
+            for (var si = 0; si < sources.length; si++) {
+              if (!oldIdx[sources[si]]) {
+                errors.push('规则 ' + (i + 1) + ': 源字段 "' + sources[si] + '" 不存在于旧模板');
+              }
+            }
+            if (rule.targetField && !newIdx[rule.targetField]) {
+              errors.push('规则 ' + (i + 1) + ': 目标字段 "' + rule.targetField + '" 不存在于新模板');
+            }
+            if (rule.targetField) {
+              if (targetFields[rule.targetField]) {
+                errors.push('规则 ' + (i + 1) + ': 目标字段 "' + rule.targetField + '" 已被其他规则映射');
+              }
+              targetFields[rule.targetField] = true;
+            }
+            break;
+
+          case 'enumRename':
+            if (rule.fieldId && !oldIdx[rule.fieldId] && !newIdx[rule.fieldId]) {
+              errors.push('规则 ' + (i + 1) + ': 字段 "' + rule.fieldId + '" 不存在');
+            }
+            break;
+
+          case 'preserveAttachment':
+          case 'softDelete':
+            if (rule.fieldId && !oldIdx[rule.fieldId]) {
+              errors.push('规则 ' + (i + 1) + ': 字段 "' + rule.fieldId + '" 不存在于旧模板');
+            }
+            break;
+        }
+      }
+
+      return { valid: errors.length === 0, errors: errors };
+    },
+
+    /**
+     * Build a chain of migration rule sets from fromVer to toVer.
+     */
+    buildMigrationChain: function (templateId, fromVer, toVer) {
+      if (fromVer >= toVer) return { complete: true, chain: [] };
+      var chain = [];
+      var missingSteps = [];
+      for (var v = fromVer; v < toVer; v++) {
+        var rs = FB.storage.getMigrationRules(templateId, v, v + 1);
+        if (rs) {
+          chain.push(rs);
+        } else {
+          missingSteps.push({ from: v, to: v + 1 });
+        }
+      }
+      if (missingSteps.length > 0) {
+        return { complete: false, chain: chain, missingSteps: missingSteps };
+      }
+      return { complete: true, chain: chain };
+    },
+
+    /**
+     * Migrate a data record through a chain of version transitions.
+     * Returns { success, data } or { success: false, error, step, originalData }
+     */
+    migrateData: function (templateId, data, targetVersion) {
+      var currentVer = data._templateVersion || 1;
+      if (currentVer >= targetVersion) {
+        return { success: true, data: FB.util.deepClone(data) };
+      }
+
+      var chainResult = this.buildMigrationChain(templateId, currentVer, targetVersion);
+      if (!chainResult.complete) {
+        return {
+          success: false,
+          error: '缺少迁移规则: ' + chainResult.missingSteps.map(function (s) {
+            return 'v' + s.from + ' -> v' + s.to;
+          }).join(', '),
+          originalData: data
+        };
+      }
+
+      var currentData = FB.util.deepClone(data);
+      for (var i = 0; i < chainResult.chain.length; i++) {
+        var rs = chainResult.chain[i];
+        var stepTpl = FB.storage.getTemplateVersion(templateId, rs.toVersion);
+        if (!stepTpl) {
+          return {
+            success: false,
+            error: '模板版本 v' + rs.toVersion + ' 不存在',
+            step: i + 1,
+            originalData: data
+          };
+        }
+        var result = this.applyRules(rs, currentData, stepTpl);
+        if (!result.success) {
+          return {
+            success: false,
+            error: '步骤 ' + (i + 1) + ' (v' + rs.fromVersion + '->v' + rs.toVersion + ') 失败: ' + result.error,
+            step: i + 1,
+            originalData: data
+          };
+        }
+        currentData = result.data;
+      }
+
+      return { success: true, data: currentData };
+    }
+  };
+
+  /* =========================================================
      ========================================================= */
   FB.compatibility = {
     mergeDataWithTemplate: function (template, data) {
