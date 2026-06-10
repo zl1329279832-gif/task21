@@ -96,18 +96,23 @@
       }
       this.template.updatedAt = FB.util.now();
       var published = FB.storage.publishTemplate(this.template);
+      this.undoManager.markBoundary('publish v' + published.version);
       FB.App.toast('模板已发布 (v' + published.version + ')', 'success');
       FB.App.refreshTemplateSelects();
     },
 
     _undo: function () {
       var prev = this.undoManager.undo(this.template.fields);
-      if (prev) {
-        this.template.fields = prev;
-        this.selectedFieldId = null;
-        this._render();
-        this._renderPropertyPanel();
+      if (!prev) return;
+      if (prev._crossedBoundary) {
+        if (!confirm('即将撤销到发布点之前的状态（' + prev._label + '），是否继续？')) return;
+        prev = this.undoManager.popBoundary(this.template.fields);
+        if (!prev) return;
       }
+      this.template.fields = prev;
+      this.selectedFieldId = null;
+      this._render();
+      this._renderPropertyPanel();
     },
 
     _redo: function () {
@@ -375,6 +380,24 @@
     },
 
     _deleteField: function (fieldId) {
+      // Check for dependent fields before deleting
+      var dependents = FB.logic.getDependents(fieldId, this.template.fields);
+      if (dependents.length > 0) {
+        var depLabels = [];
+        for (var di = 0; di < dependents.length; di++) {
+          for (var fi = 0; fi < this.template.fields.length; fi++) {
+            if (this.template.fields[fi].id === dependents[di]) {
+              depLabels.push(this.template.fields[fi].label);
+              break;
+            }
+          }
+        }
+        if (!confirm('以下字段依赖此字段的联动条件：\n' + depLabels.join('、') +
+            '\n\n删除后这些条件将失效。是否继续？')) {
+          return;
+        }
+      }
+
       this._saveUndoState();
       for (var i = 0; i < this.template.fields.length; i++) {
         if (this.template.fields[i].id === fieldId) {
@@ -559,8 +582,23 @@
       var subTypes = ['text','number','date','radio','checkbox'];
       var html = '<div class="prop-group"><div class="prop-group-title">表格列定义</div>';
       html += '<div class="subfield-list">';
+
+      var hasDeleted = false;
+      var deletedHtml = '';
+
       for (var i = 0; i < subs.length; i++) {
         var sf = subs[i];
+
+        if (sf._deleted) {
+          hasDeleted = true;
+          deletedHtml +=
+            '<div class="subfield-item" data-index="' + i + '" style="opacity:0.5;text-decoration:line-through;">' +
+              '<span style="flex:1;font-size:12px;">' + FB.util.escapeHtml(sf.label) + ' (' + sf.type + ')</span>' +
+              '<button class="btn-add-option" data-sf-restore="' + i + '" style="font-size:11px;padding:2px 6px;">恢复</button>' +
+            '</div>';
+          continue;
+        }
+
         var typeOptions = '';
         for (var t = 0; t < subTypes.length; t++) {
           typeOptions += '<option value="' + subTypes[t] + '"' + (sf.type === subTypes[t] ? ' selected' : '') + '>' + FB.FIELD_TYPES[subTypes[t]].label + '</option>';
@@ -576,6 +614,14 @@
           '</div>';
       }
       html += '</div>';
+
+      if (hasDeleted) {
+        html += '<div style="margin-top:8px;padding-top:8px;border-top:1px dashed #ccc;">';
+        html += '<div style="font-size:11px;color:#999;margin-bottom:4px;">已删除列（旧数据仍保留）</div>';
+        html += '<div class="subfield-list">' + deletedHtml + '</div>';
+        html += '</div>';
+      }
+
       html += '<button class="btn-add-option" id="btn-add-subfield">+ 添加列</button>';
       html += '</div>';
       return html;
@@ -585,12 +631,20 @@
       var conditions = field.conditions || [];
       var otherFields = this._getOtherFields(field.id);
 
+      // Build a map of all non-deleted field IDs for orphan detection
+      var activeFieldIds = {};
+      for (var af = 0; af < otherFields.length; af++) {
+        activeFieldIds[otherFields[af].id] = true;
+      }
+
       var html = '<div class="prop-group"><div class="prop-group-title">联动显示条件</div>';
       html += '<div class="condition-editor">';
 
       if (conditions.length > 0) {
         for (var i = 0; i < conditions.length; i++) {
           var cond = conditions[i];
+          var isOrphan = cond.field && !activeFieldIds[cond.field];
+
           var fieldOpts = '<option value="">选择字段</option>';
           for (var fi = 0; fi < otherFields.length; fi++) {
             fieldOpts += '<option value="' + otherFields[fi].id + '"' + (cond.field === otherFields[fi].id ? ' selected' : '') + '>' + FB.util.escapeHtml(otherFields[fi].label) + '</option>';
@@ -601,12 +655,14 @@
             opOpts += '<option value="' + ops[oi][0] + '"' + (cond.operator === ops[oi][0] ? ' selected' : '') + '>' + ops[oi][1] + '</option>';
           }
 
+          var orphanStyle = isOrphan ? 'border:1px solid var(--danger);background:#fff5f5;' : '';
           html +=
-            '<div class="condition-row" data-cond-index="' + i + '">' +
+            '<div class="condition-row" data-cond-index="' + i + '" style="' + orphanStyle + '">' +
               '<select data-cond="field">' + fieldOpts + '</select>' +
               '<select data-cond="operator">' + opOpts + '</select>' +
               '<input data-cond="value" value="' + FB.util.escapeHtml(cond.value || '') + '" placeholder="值"' + (cond.operator === 'notEmpty' ? ' disabled' : '') + '>' +
               '<button class="btn-remove-option" data-cond-remove="' + i + '">✕</button>' +
+              (isOrphan ? '<div style="color:var(--danger);font-size:11px;margin-top:2px;">⚠ 引用字段已删除</div>' : '') +
             '</div>';
         }
       } else {
@@ -725,7 +781,19 @@
       $$('[data-sf-remove]', this.propContent).forEach(function (btn) {
         btn.addEventListener('click', function () {
           self._saveUndoState();
-          field.subFields.splice(Number(btn.dataset.sfRemove), 1);
+          var idx = Number(btn.dataset.sfRemove);
+          field.subFields[idx]._deleted = true;
+          field.subFields[idx]._deletedAt = FB.util.now();
+          self._renderPropertyPanel();
+        });
+      });
+
+      $$('[data-sf-restore]', this.propContent).forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          self._saveUndoState();
+          var idx = Number(btn.dataset.sfRestore);
+          delete field.subFields[idx]._deleted;
+          delete field.subFields[idx]._deletedAt;
           self._renderPropertyPanel();
         });
       });

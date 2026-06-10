@@ -24,13 +24,14 @@
       this.template = template;
       this.isPreview = !!opts.isPreview;
       this.recordId = opts.recordId || FB.util.uid();
+      this._templateVersion = template.version;
 
       this.values = {};
       this._initDefaults(template.fields);
       if (initialData) {
         this.values = FB.compatibility.mergeDataWithTemplate(template, initialData);
       }
-      this.values._templateVersion = template.version;
+      this.values._templateVersion = this._templateVersion;
       this.values._recordId = this.recordId;
       this.errors = {};
       this._buildDOM();
@@ -74,23 +75,80 @@
       meta.textContent = '模板版本: v' + this.template.version + ' | 记录ID: ' + this.recordId.slice(0, 12);
       form.appendChild(meta);
 
-      // Show deleted field data notice
-      var deletedWithData = FB.compatibility.getDeletedFieldsWithData(this.template, this.values);
-      if (deletedWithData.length > 0) {
-        var notice = document.createElement('div');
-        notice.style.cssText = 'background:#fff3cd;border:1px solid #ffc107;border-radius:6px;padding:10px;margin-bottom:16px;font-size:12px;';
-        notice.innerHTML = '<strong>⚠ 旧字段数据:</strong> 以下字段已从模板中删除，但数据已保留：';
-        var ul = document.createElement('ul');
-        ul.style.cssText = 'margin:4px 0 0 16px;';
-        for (var di = 0; di < deletedWithData.length; di++) {
-          var d = deletedWithData[di];
-          var li = document.createElement('li');
-          var val = Array.isArray(d.value) ? JSON.stringify(d.value) : String(d.value);
-          li.textContent = d.id.slice(0, 8) + ': ' + (val.length > 50 ? val.slice(0, 50) + '...' : val);
-          ul.appendChild(li);
+      // Show archived deleted field data
+      var archivedFields = FB.compatibility.collectArchivedFields(this.template, this.values);
+      if (archivedFields.length > 0) {
+        var archive = document.createElement('div');
+        archive.style.cssText = 'background:#fff3cd;border:1px solid #ffc107;border-radius:6px;margin-bottom:16px;font-size:12px;';
+
+        var archiveHeader = document.createElement('div');
+        archiveHeader.style.cssText = 'padding:10px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;';
+        archiveHeader.innerHTML =
+          '<strong>归档数据 (' + archivedFields.length + ' 个已删除字段)</strong>' +
+          '<span style="font-size:16px;">▼</span>';
+        archive.appendChild(archiveHeader);
+
+        var archiveBody = document.createElement('div');
+        archiveBody.style.cssText = 'padding:0 10px 10px;display:none;';
+
+        var table = document.createElement('table');
+        table.style.cssText = 'width:100%;border-collapse:collapse;font-size:12px;';
+        table.innerHTML =
+          '<thead><tr style="border-bottom:1px solid #ddd;">' +
+            '<th style="text-align:left;padding:4px 8px;">字段名</th>' +
+            '<th style="text-align:left;padding:4px 8px;">所属</th>' +
+            '<th style="text-align:left;padding:4px 8px;">归档值</th>' +
+          '</tr></thead>';
+        var tbody = document.createElement('tbody');
+
+        for (var ai = 0; ai < archivedFields.length; ai++) {
+          var af = archivedFields[ai];
+          var tr = document.createElement('tr');
+          tr.style.cssText = 'border-bottom:1px solid #eee;';
+
+          var labelCell = document.createElement('td');
+          labelCell.style.cssText = 'padding:4px 8px;font-weight:500;';
+          labelCell.textContent = af.label;
+          tr.appendChild(labelCell);
+
+          var parentCell = document.createElement('td');
+          parentCell.style.cssText = 'padding:4px 8px;color:#666;';
+          parentCell.textContent = af.parentLabel || '—';
+          tr.appendChild(parentCell);
+
+          var valCell = document.createElement('td');
+          valCell.style.cssText = 'padding:4px 8px;color:#333;word-break:break-all;';
+          if (Array.isArray(af.value) && af.value.length > 0 && af.value[0].row !== undefined) {
+            // Table sub-field archived rows
+            var parts = [];
+            for (var ar = 0; ar < af.value.length; ar++) {
+              parts.push('第' + af.value[ar].row + '行: ' + String(af.value[ar].value));
+            }
+            valCell.textContent = parts.join('; ');
+          } else if (Array.isArray(af.value)) {
+            valCell.textContent = JSON.stringify(af.value);
+          } else {
+            var valStr = String(af.value);
+            valCell.textContent = valStr.length > 80 ? valStr.slice(0, 80) + '...' : valStr;
+          }
+          tr.appendChild(valCell);
+
+          tbody.appendChild(tr);
         }
-        notice.appendChild(ul);
-        form.appendChild(notice);
+        table.appendChild(tbody);
+        archiveBody.appendChild(table);
+        archive.appendChild(archiveBody);
+
+        // Toggle collapse
+        (function (header, body, arrow) {
+          header.addEventListener('click', function () {
+            var isOpen = body.style.display !== 'none';
+            body.style.display = isOpen ? 'none' : 'block';
+            arrow.textContent = isOpen ? '▼' : '▲';
+          });
+        })(archiveHeader, archiveBody, archiveHeader.querySelector('span'));
+
+        form.appendChild(archive);
       }
 
       this._renderFields(this.template.fields, form);
@@ -274,17 +332,21 @@
     _renderTableField: function (f) {
       var rows = this.values[f.id] || [];
       var subs = f.subFields || [];
+      var activeSubs = [];
+      for (var ai = 0; ai < subs.length; ai++) {
+        if (!subs[ai]._deleted) activeSubs.push(subs[ai]);
+      }
 
       var headerHtml = '';
-      for (var i = 0; i < subs.length; i++) {
-        headerHtml += '<th>' + FB.util.escapeHtml(subs[i].label) +
-          (subs[i].required ? '<span class="required-star">*</span>' : '') + '</th>';
+      for (var i = 0; i < activeSubs.length; i++) {
+        headerHtml += '<th>' + FB.util.escapeHtml(activeSubs[i].label) +
+          (activeSubs[i].required ? '<span class="required-star">*</span>' : '') + '</th>';
       }
       if (!this.isPreview) headerHtml += '<th class="row-actions">操作</th>';
 
       var bodyHtml = '';
       for (var ri = 0; ri < rows.length; ri++) {
-        bodyHtml += this._renderTableRow(f, rows[ri], ri, subs);
+        bodyHtml += this._renderTableRow(f, rows[ri], ri, activeSubs);
       }
 
       var hints = '';
@@ -538,6 +600,7 @@
       var newRow = {};
       var subs = field.subFields || [];
       for (var j = 0; j < subs.length; j++) {
+        if (subs[j]._deleted) continue;
         newRow[subs[j].id] = subs[j].type === 'checkbox' ? [] : '';
       }
       rows.push(newRow);
@@ -571,10 +634,14 @@
       tbody.innerHTML = '';
       var rows = this.values[fieldId] || [];
       var subs = field.subFields || [];
+      var activeSubs = [];
+      for (var ai = 0; ai < subs.length; ai++) {
+        if (!subs[ai]._deleted) activeSubs.push(subs[ai]);
+      }
       for (var ri = 0; ri < rows.length; ri++) {
         var tr = document.createElement('tr');
         tr.dataset.rowIndex = ri;
-        tr.innerHTML = this._renderTableRow(field, rows[ri], ri, subs);
+        tr.innerHTML = this._renderTableRow(field, rows[ri], ri, activeSubs);
         tbody.appendChild(tr);
       }
     },
@@ -612,8 +679,29 @@
       var form = this.container.querySelector('.rendered-form');
       if (!form) return;
 
+      // Build field existence map for orphan detection
+      var fieldExists = {};
+      var buildMap = function (flds) {
+        for (var k = 0; k < flds.length; k++) {
+          fieldExists[flds[k].id] = !flds[k]._deleted;
+          if (flds[k].type === 'group' && flds[k].children) buildMap(flds[k].children);
+        }
+      };
+      buildMap(fields);
+
       var toggleField = function (field) {
         if (field._deleted) return;
+
+        // Check for orphaned conditions
+        if (field.conditions) {
+          for (var ci = 0; ci < field.conditions.length; ci++) {
+            var condFieldId = field.conditions[ci].field;
+            if (condFieldId && !fieldExists[condFieldId]) {
+              console.warn('[FormBuilder] 字段 "' + field.label + '" 的联动条件引用了已删除的字段 ' + condFieldId);
+            }
+          }
+        }
+
         var el = form.querySelector('[data-field-id="' + field.id + '"]');
         if (el) {
           var hidden = FB.logic.isFieldHidden(field, self.values, fields);
@@ -681,6 +769,7 @@
     saveDraft: function () {
       this.values._draft = true;
       this.values._savedAt = FB.util.now();
+      this.values._templateVersion = this._templateVersion;
       FB.storage.saveFormData(this.template.id, this.recordId, this.getValues());
       return this.recordId;
     },

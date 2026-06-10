@@ -280,6 +280,7 @@
               var row = v[ri];
               for (var si = 0; si < fc.subFields.length; si++) {
                 var sf = fc.subFields[si];
+                if (sf._deleted) continue;
                 var rowVal = row[sf.id];
                 if (sf.required && (rowVal === undefined || rowVal === null || rowVal === '')) {
                   errors.push('第 ' + (ri + 1) + ' 行 "' + sf.label + '" 不能为空');
@@ -361,6 +362,10 @@
     },
 
     _evalCondition: function (cond, values) {
+      // Guard: if referenced field doesn't exist in values at all, treat as false
+      if (cond.field && !(cond.field in values)) {
+        return false;
+      }
       var depVal = values[cond.field];
       switch (cond.operator) {
         case 'equals': return String(depVal) === String(cond.value);
@@ -482,10 +487,34 @@
       this._redoStack = [];
       this._notify();
     },
+    /** Insert a named boundary marker into the undo stack */
+    markBoundary: function (label) {
+      this._stack.push({ _boundary: true, _label: label || 'boundary' });
+      this._redoStack = [];
+      this._notify();
+    },
     undo: function (currentState) {
       if (this._stack.length === 0) return null;
+      var prev = this._stack[this._stack.length - 1];
+      // Detect boundary marker
+      if (prev && prev._boundary) {
+        return { _crossedBoundary: true, _label: prev._label };
+      }
+      this._stack.pop();
       this._redoStack.push(FB.util.deepClone(currentState));
+      this._notify();
+      return prev;
+    },
+    /** Force pop past a boundary marker (called after user confirms) */
+    popBoundary: function (currentState) {
+      if (this._stack.length === 0) return null;
+      var top = this._stack[this._stack.length - 1];
+      if (top && top._boundary) {
+        this._stack.pop(); // remove boundary marker
+      }
+      if (this._stack.length === 0) return null;
       var prev = this._stack.pop();
+      this._redoStack.push(FB.util.deepClone(currentState));
       this._notify();
       return prev;
     },
@@ -583,6 +612,7 @@
         if (f.type === 'table') {
           if (f.subFields) {
             for (var j = 0; j < f.subFields.length; j++) {
+              if (f.subFields[j]._deleted) continue;
               headers.push(f.label + '.' + f.subFields[j].label);
             }
           }
@@ -611,6 +641,7 @@
             var rowData = tableData[ri] || {};
             if (tableFields[tf].subFields) {
               for (var sfi = 0; sfi < tableFields[tf].subFields.length; sfi++) {
+                if (tableFields[tf].subFields[sfi]._deleted) continue;
                 row.push(this._csvEscape(rowData[tableFields[tf].subFields[sfi].id] || ''));
               }
             }
@@ -732,6 +763,90 @@
         var f = fields[i];
         if (!f._deleted) map[f.id] = true;
         if (f.type === 'group' && f.children) this._collectFieldIds(f.children, map);
+        if (f.type === 'table' && f.subFields) {
+          for (var j = 0; j < f.subFields.length; j++) {
+            if (!f.subFields[j]._deleted) map[f.subFields[j].id] = true;
+          }
+        }
+      }
+    },
+
+    /**
+     * Collect all deleted fields (top-level and table sub-fields) that still have data.
+     * Returns array of { id, label, type, parentLabel, value, deletedAt }.
+     */
+    collectArchivedFields: function (template, data) {
+      var result = [];
+      var walk = function (fields, parentLabel) {
+        for (var i = 0; i < fields.length; i++) {
+          var f = fields[i];
+          // Deleted top-level field with data
+          if (f._deleted && data[f.id] !== undefined && data[f.id] !== '' && data[f.id] !== null) {
+            result.push({
+              id: f.id,
+              label: f.label,
+              type: f.type,
+              parentLabel: parentLabel || null,
+              value: data[f.id],
+              deletedAt: f._deletedAt || null
+            });
+          }
+          // Deleted table sub-fields
+          if (f.type === 'table' && f.subFields) {
+            var rows = data[f.id] || [];
+            for (var j = 0; j < f.subFields.length; j++) {
+              var sf = f.subFields[j];
+              if (sf._deleted && rows.length > 0) {
+                var archivedRows = [];
+                for (var ri = 0; ri < rows.length; ri++) {
+                  if (rows[ri] && rows[ri][sf.id] !== undefined && rows[ri][sf.id] !== '') {
+                    archivedRows.push({ row: ri + 1, value: rows[ri][sf.id] });
+                  }
+                }
+                if (archivedRows.length > 0) {
+                  result.push({
+                    id: sf.id,
+                    label: sf.label,
+                    type: sf.type,
+                    parentLabel: f.label + (f._deleted ? ' (已删除)' : ''),
+                    value: archivedRows,
+                    deletedAt: sf._deletedAt || null
+                  });
+                }
+              }
+            }
+          }
+          // Recurse into group children
+          if (f.type === 'group' && f.children) walk(f.children, f.label);
+        }
+      };
+      walk(template.fields, null);
+
+      // Also check for orphan data keys (field IDs in data that don't exist in template at all)
+      var currentIds = {};
+      this._collectAllFieldIdsIncludingDeleted(template.fields, currentIds);
+      for (var key in data) {
+        if (key.charAt(0) === '_') continue;
+        if (!currentIds[key] && data[key] !== undefined && data[key] !== '' && data[key] !== null) {
+          result.push({
+            id: key,
+            label: '(未知字段)',
+            type: 'unknown',
+            parentLabel: null,
+            value: data[key],
+            deletedAt: null
+          });
+        }
+      }
+
+      return result;
+    },
+
+    _collectAllFieldIdsIncludingDeleted: function (fields, map) {
+      for (var i = 0; i < fields.length; i++) {
+        var f = fields[i];
+        map[f.id] = true;
+        if (f.type === 'group' && f.children) this._collectAllFieldIdsIncludingDeleted(f.children, map);
         if (f.type === 'table' && f.subFields) {
           for (var j = 0; j < f.subFields.length; j++) {
             map[f.subFields[j].id] = true;

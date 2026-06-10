@@ -96,6 +96,15 @@
           if (confirm('发现未完成的草稿，是否继续编辑？')) {
             initialData = drafts[drafts.length - 1].data;
             recordId = drafts[drafts.length - 1].recordId;
+            // Use the template version the draft was created against
+            if (initialData._templateVersion) {
+              var versionTpl = FB.storage.getTemplateVersion(tplId, initialData._templateVersion);
+              if (versionTpl) {
+                tpl = versionTpl;
+              } else {
+                self.toast('草稿对应的模板版本 (v' + initialData._templateVersion + ') 未找到，使用最新版本', 'error');
+              }
+            }
           }
         }
 
@@ -147,7 +156,8 @@
 
       $('#btn-save-draft-fill').disabled = false;
       $('#btn-submit-fill').disabled = false;
-      $('#fill-status').textContent = '填报中...';
+      var versionInfo = tpl.version ? ' (v' + tpl.version + ')' : '';
+      $('#fill-status').textContent = '填报中...' + versionInfo;
 
       if (this._autoSaveTimer) clearInterval(this._autoSaveTimer);
       this._autoSaveTimer = setInterval(function () {
@@ -332,9 +342,13 @@
         var tplId = $('#export-data-template').value;
         var recId = $('#export-data-record').value;
         if (!tplId || !recId) { self.toast('请选择模板和记录', 'error'); return; }
-        var tpl = FB.storage.getTemplateLatest(tplId);
         var rec = FB.storage.getFormData(tplId, recId);
-        if (!tpl || !rec) { self.toast('数据不存在', 'error'); return; }
+        if (!rec) { self.toast('数据不存在', 'error'); return; }
+        // Use the version the data was created against
+        var tpl = (rec.data._templateVersion) ?
+          (FB.storage.getTemplateVersion(tplId, rec.data._templateVersion) || FB.storage.getTemplateLatest(tplId)) :
+          FB.storage.getTemplateLatest(tplId);
+        if (!tpl) { self.toast('模板不存在', 'error'); return; }
 
         var json = FB.io.exportData(tpl, rec.data);
         $('#export-data-output').textContent = json;
@@ -346,9 +360,13 @@
         var tplId = $('#export-data-template').value;
         var recId = $('#export-data-record').value;
         if (!tplId || !recId) { self.toast('请选择模板和记录', 'error'); return; }
-        var tpl = FB.storage.getTemplateLatest(tplId);
         var rec = FB.storage.getFormData(tplId, recId);
-        if (!tpl || !rec) { self.toast('数据不存在', 'error'); return; }
+        if (!rec) { self.toast('数据不存在', 'error'); return; }
+        // Use the version the data was created against
+        var tpl = (rec.data._templateVersion) ?
+          (FB.storage.getTemplateVersion(tplId, rec.data._templateVersion) || FB.storage.getTemplateLatest(tplId)) :
+          FB.storage.getTemplateLatest(tplId);
+        if (!tpl) { self.toast('模板不存在', 'error'); return; }
 
         var csv = FB.io.exportDataCSV(tpl, rec.data);
         $('#export-data-output').textContent = csv;
@@ -375,23 +393,41 @@
         var existing = FB.storage.getTemplateIndex();
         var tpl = validation.template;
         var hasConflict = false;
+        var existingEntry = null;
         for (var i = 0; i < existing.length; i++) {
-          if (existing[i].id === tpl.id) { hasConflict = true; break; }
+          if (existing[i].id === tpl.id) { hasConflict = true; existingEntry = existing[i]; break; }
         }
         if (hasConflict) {
-          if (!confirm('已存在同名模板，是否覆盖？取消则创建为新模板。')) {
+          var nextVer = existingEntry.version + 1;
+          if (!confirm('已存在模板 "' + existingEntry.name + '" (当前 v' + existingEntry.version + ')。\n\n' +
+              '覆盖将作为新版本 v' + nextVer + ' 发布。\n' +
+              '取消则创建为新模板（新 ID）。')) {
             tpl.id = FB.util.uid();
           }
         }
+
+        // Add import metadata
+        tpl._importedAt = FB.util.now();
+        tpl._importSource = 'import';
+        tpl._originalVersion = data.version || 0;
 
         this._ensureFieldIds(tpl.fields);
         FB.storage.saveTemplateDraft(tpl);
         var published = FB.storage.publishTemplate(tpl);
 
+        var warnings = '';
+        if (tpl._originalVersion && existingEntry && tpl._originalVersion < existingEntry.version) {
+          warnings = '<br><span style="color:var(--warning);">⚠ 导入的模板原始版本 (v' +
+            tpl._originalVersion + ') 低于当前最新版本 (v' + existingEntry.version +
+            ')，已作为 v' + published.version + ' 发布</span>';
+        }
+
         resultBox.className = 'result-box success';
         resultBox.innerHTML = '<strong>导入成功!</strong><br>模板: ' + FB.util.escapeHtml(published.name) +
           '<br>版本: v' + published.version +
-          '<br>字段数: ' + tpl.fields.length;
+          '<br>字段数: ' + tpl.fields.length +
+          (tpl._importSource ? '<br><span style="font-size:11px;color:#999;">来源: 导入</span>' : '') +
+          warnings;
         self.toast('模板导入成功', 'success');
         self.refreshTemplateSelects();
 
