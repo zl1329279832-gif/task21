@@ -94,11 +94,257 @@
         FB.App.toast('发现联动条件循环依赖，请检查', 'error');
         return;
       }
+
+      var latestTpl = FB.storage.getTemplateLatest(this.template.id);
+
+      // First publish or no previous version → skip impact assessment
+      if (!latestTpl || latestTpl.version === 0) {
+        this._doPublish(null);
+        return;
+      }
+
+      // Run diff and impact assessment
+      var diff = FB.migration.diffTemplates(latestTpl, this.template);
+      if (diff.summary.totalChanges === 0) {
+        this._doPublish(null);
+        return;
+      }
+
+      var impact = FB.impact.assess(diff, this.template.id);
+      var suggestions = FB.migration.detectFieldCorrespondence(latestTpl, this.template);
+      this._showImpactModal(diff, impact, suggestions, latestTpl);
+    },
+
+    _doPublish: function (migrationConfig) {
       this.template.updatedAt = FB.util.now();
       var published = FB.storage.publishTemplate(this.template);
+
+      if (migrationConfig) {
+        migrationConfig.templateId = this.template.id;
+        migrationConfig.fromVersion = published.version - 1;
+        migrationConfig.toVersion = published.version;
+        FB.storage.saveMigrationConfig(this.template.id, published.version, migrationConfig);
+      }
+
       this.undoManager.markBoundary('publish v' + published.version);
       FB.App.toast('模板已发布 (v' + published.version + ')', 'success');
       FB.App.refreshTemplateSelects();
+    },
+
+    _showImpactModal: function (diff, impact, suggestions, oldTpl) {
+      var self = this;
+      var body = document.createElement('div');
+      body.style.maxHeight = '70vh';
+      body.style.overflowY = 'auto';
+
+      // Summary + report
+      var reportHtml = FB.impact.generateReport(impact, diff);
+      var reportDiv = document.createElement('div');
+      reportDiv.innerHTML = reportHtml;
+      body.appendChild(reportDiv);
+
+      // Mapping rules section (only if breaking changes)
+      var ruleSection = null;
+      if (impact.hasBreakingChanges) {
+        ruleSection = this._buildMappingRuleUI(suggestions, diff, impact);
+        body.appendChild(ruleSection);
+      }
+
+      FB.App.showModal('发布影响评估报告', body, [
+        {
+          label: '取消发布',
+          cls: 'btn-secondary',
+          action: function () { FB.App.hideModal(); }
+        },
+        {
+          label: '无规则直接发布',
+          cls: 'btn-secondary',
+          action: function () {
+            if (impact.hasBreakingChanges) {
+              if (!confirm('存在高风险变更，不配置映射规则可能导致历史数据显示异常。确定要继续吗？')) return;
+            }
+            FB.App.hideModal();
+            self._doPublish(null);
+          }
+        },
+        {
+          label: impact.hasBreakingChanges ? '配置规则并发布' : '确认发布',
+          cls: 'btn-primary',
+          action: function () {
+            var config = null;
+            if (ruleSection) {
+              config = self._collectMappingConfig(ruleSection);
+            }
+            FB.App.hideModal();
+            self._doPublish(config);
+          }
+        }
+      ]);
+    },
+
+    _buildMappingRuleUI: function (suggestions, diff, impact) {
+      var section = document.createElement('div');
+      section.className = 'mapping-rule-section';
+      section.id = 'mapping-rule-container';
+
+      var header = document.createElement('div');
+      header.className = 'rule-section-header';
+      header.innerHTML = '<span>字段映射规则配置</span><span style="font-size:11px;color:#999;">' + suggestions.length + ' 个建议</span>';
+      section.appendChild(header);
+
+      if (suggestions.length === 0) {
+        var empty = document.createElement('div');
+        empty.style.cssText = 'padding:16px;text-align:center;color:#999;font-size:13px;';
+        empty.textContent = '未检测到可自动映射的字段变更';
+        section.appendChild(empty);
+        return section;
+      }
+
+      // Collect available target fields for merge
+      var newFields = FB.migration.flattenFields(this.template.fields, false);
+      var targetOptions = '';
+      for (var fid in newFields) {
+        if (newFields[fid].type !== 'group') {
+          targetOptions += '<option value="' + fid + '">' + FB.util.escapeHtml(newFields[fid].label) + '</option>';
+        }
+      }
+
+      for (var i = 0; i < suggestions.length; i++) {
+        var s = suggestions[i];
+        var card = document.createElement('div');
+        card.className = 'mapping-rule-card';
+        card.setAttribute('data-rule-type', s.type);
+        card.setAttribute('data-rule-index', i);
+
+        var toggleHtml = '<div class="rule-toggle"><input type="checkbox" class="rule-enabled" checked> <strong>';
+
+        if (s.type === 'field_merge') {
+          toggleHtml += '字段合并</strong></div>';
+          var sourceLabels = (s.sourceLabels || []).map(function (l) { return FB.util.escapeHtml(l); }).join(' + ');
+          card.innerHTML = toggleHtml +
+            '<div class="rule-fields">' +
+            '<span class="rule-source-labels">' + sourceLabels + '</span>' +
+            '<span class="rule-arrow">→</span>' +
+            '<select class="rule-target">' + targetOptions + '</select>' +
+            '<select class="rule-strategy">' +
+            '<option value="concatenate">拼接</option>' +
+            '<option value="take_first">取第一个</option>' +
+            '<option value="take_last">取最后一个</option>' +
+            '</select>' +
+            '<input type="text" class="rule-separator" value=" " placeholder="分隔符" style="width:50px;">' +
+            '</div>';
+          card.setAttribute('data-source-ids', JSON.stringify(s.sourceFieldIds));
+          card.setAttribute('data-target-id', s.targetFieldId || '');
+
+        } else if (s.type === 'enum_rename') {
+          toggleHtml += '枚举值重命名</strong>: ' + FB.util.escapeHtml(s.fieldLabel) + '</div>';
+          var tableHtml = '<table class="enum-mapping-table"><tr><th>旧值</th><th></th><th>新值</th></tr>';
+          for (var mi = 0; mi < s.mappings.length; mi++) {
+            tableHtml += '<tr>' +
+              '<td><input type="text" class="enum-old-value" value="' + FB.util.escapeHtml(s.mappings[mi].oldValue) + '" readonly></td>' +
+              '<td>→</td>' +
+              '<td><input type="text" class="enum-new-value" value="' + FB.util.escapeHtml(s.mappings[mi].newValue) + '"></td>' +
+              '</tr>';
+          }
+          tableHtml += '</table>';
+          card.innerHTML = toggleHtml + tableHtml;
+          card.setAttribute('data-field-id', s.fieldId);
+
+        } else if (s.type === 'attachment_preserve') {
+          toggleHtml += '附件保留</strong>: ' + FB.util.escapeHtml(s.fieldLabel) + '</div>';
+          // Collect attachment fields in new template for migrate_to option
+          var attachOpts = '<option value="">保留为归档</option>';
+          for (var afid in newFields) {
+            if (newFields[afid].type === 'attachment' && afid !== s.fieldId) {
+              attachOpts += '<option value="' + afid + '">迁移到: ' + FB.util.escapeHtml(newFields[afid].label) + '</option>';
+            }
+          }
+          card.innerHTML = toggleHtml +
+            '<div class="rule-fields">' +
+            '<select class="rule-preserve-mode">' + attachOpts + '</select>' +
+            '</div>';
+          card.setAttribute('data-field-id', s.fieldId);
+        }
+
+        // Toggle enable/disable styling
+        var checkbox = card.querySelector('.rule-enabled');
+        if (checkbox) {
+          checkbox.addEventListener('change', function () {
+            this.closest('.mapping-rule-card').classList.toggle('disabled', !this.checked);
+          });
+        }
+
+        section.appendChild(card);
+      }
+
+      return section;
+    },
+
+    _collectMappingConfig: function (ruleContainer) {
+      var cards = ruleContainer.querySelectorAll('.mapping-rule-card');
+      var rules = [];
+      var ruleId = 0;
+
+      for (var i = 0; i < cards.length; i++) {
+        var card = cards[i];
+        var enabled = card.querySelector('.rule-enabled');
+        if (enabled && !enabled.checked) continue;
+
+        var type = card.getAttribute('data-rule-type');
+        ruleId++;
+
+        if (type === 'field_merge') {
+          var sourceIds = JSON.parse(card.getAttribute('data-source-ids') || '[]');
+          var targetSel = card.querySelector('.rule-target');
+          var strategySel = card.querySelector('.rule-strategy');
+          var sepInput = card.querySelector('.rule-separator');
+          rules.push({
+            ruleId: 'rule_' + ruleId,
+            type: 'field_merge',
+            enabled: true,
+            sourceFieldIds: sourceIds,
+            targetFieldId: targetSel ? targetSel.value : card.getAttribute('data-target-id'),
+            mergeStrategy: strategySel ? strategySel.value : 'concatenate',
+            mergeOptions: { separator: sepInput ? sepInput.value : ' ' }
+          });
+
+        } else if (type === 'enum_rename') {
+          var fieldId = card.getAttribute('data-field-id');
+          var oldInputs = card.querySelectorAll('.enum-old-value');
+          var newInputs = card.querySelectorAll('.enum-new-value');
+          var mappings = [];
+          for (var mi = 0; mi < oldInputs.length; mi++) {
+            if (oldInputs[mi].value && newInputs[mi].value) {
+              mappings.push({ oldValue: oldInputs[mi].value, newValue: newInputs[mi].value });
+            }
+          }
+          if (mappings.length > 0) {
+            rules.push({
+              ruleId: 'rule_' + ruleId,
+              type: 'enum_rename',
+              enabled: true,
+              fieldId: fieldId,
+              mappings: mappings
+            });
+          }
+
+        } else if (type === 'attachment_preserve') {
+          var aFieldId = card.getAttribute('data-field-id');
+          var modeSel = card.querySelector('.rule-preserve-mode');
+          var modeVal = modeSel ? modeSel.value : '';
+          rules.push({
+            ruleId: 'rule_' + ruleId,
+            type: 'attachment_preserve',
+            enabled: true,
+            fieldId: aFieldId,
+            preserveAs: modeVal ? 'migrate_to' : 'archive',
+            migrateToFieldId: modeVal || null
+          });
+        }
+      }
+
+      if (rules.length === 0) return null;
+      return { templateId: '', fromVersion: 0, toVersion: 0, rules: rules, createdAt: FB.util.now() };
     },
 
     _undo: function () {

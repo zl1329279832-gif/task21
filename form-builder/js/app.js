@@ -282,6 +282,21 @@
         '<button class="btn btn-secondary" id="btn-export-version">导出此版本</button>';
       detail.appendChild(actions);
 
+      // Show migration config if exists
+      var migConfig = FB.storage.getMigrationConfig(templateId, version.version);
+      if (migConfig && migConfig.rules && migConfig.rules.length > 0) {
+        var migDiv = document.createElement('div');
+        migDiv.style.cssText = 'margin-top:12px;padding:10px;background:#e3f2fd;border:1px solid #90caf9;border-radius:6px;';
+        var ruleSummary = migConfig.rules.map(function (r) {
+          var typeLabels = { field_merge: '字段合并', enum_rename: '枚举重命名', attachment_preserve: '附件保留' };
+          return (typeLabels[r.type] || r.type) + (r.enabled ? '' : ' (禁用)');
+        }).join('、');
+        migDiv.innerHTML =
+          '<div style="font-size:12px;font-weight:600;margin-bottom:4px;">迁移规则 (v' + migConfig.fromVersion + ' → v' + version.version + ')</div>' +
+          '<div style="font-size:11px;color:#555;">' + migConfig.rules.length + ' 条规则: ' + FB.util.escapeHtml(ruleSummary) + '</div>';
+        detail.appendChild(migDiv);
+      }
+
       $('#btn-load-version-edit').addEventListener('click', function () {
         self.designer.loadTemplate(version);
         self.switchTab('designer');
@@ -298,8 +313,55 @@
     _showDataWithVersion: function (version, data) {
       var self = this;
       var body = document.createElement('div');
-      var renderer = new FB.Renderer(body);
-      renderer.render(version, data, { isPreview: true, recordId: data._recordId || 'unknown' });
+
+      // Check if newer versions exist
+      var latestTpl = FB.storage.getTemplateLatest(version.id || $('#history-template-select').value);
+      var hasNewerVersion = latestTpl && latestTpl.version > version.version;
+
+      if (hasNewerVersion) {
+        // Add view mode toggle
+        var toggleDiv = document.createElement('div');
+        toggleDiv.style.cssText = 'margin-bottom:12px;padding:8px;background:#f5f5f5;border-radius:6px;display:flex;gap:16px;';
+        toggleDiv.innerHTML =
+          '<label style="font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer;">' +
+            '<input type="radio" name="history-view-mode" value="original" checked> 原始版本视图 (v' + version.version + ')' +
+          '</label>' +
+          '<label style="font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer;">' +
+            '<input type="radio" name="history-view-mode" value="migration"> 迁移视图 (→ v' + latestTpl.version + ')' +
+          '</label>';
+        body.appendChild(toggleDiv);
+      }
+
+      var viewContainer = document.createElement('div');
+      viewContainer.id = 'history-data-view';
+      body.appendChild(viewContainer);
+
+      function renderView(mode) {
+        viewContainer.innerHTML = '';
+        var r = new FB.Renderer(viewContainer);
+        if (mode === 'migration' && hasNewerVersion) {
+          r.render(latestTpl, data, {
+            isPreview: true,
+            recordId: data._recordId || 'unknown',
+            migrationView: true,
+            migrationTargetVersion: latestTpl.version
+          });
+        } else {
+          r.render(version, data, { isPreview: true, recordId: data._recordId || 'unknown' });
+        }
+      }
+
+      renderView('original');
+
+      if (hasNewerVersion) {
+        var radios = body.querySelectorAll('input[name="history-view-mode"]');
+        for (var ri = 0; ri < radios.length; ri++) {
+          radios[ri].addEventListener('change', function () {
+            renderView(this.value);
+          });
+        }
+      }
+
       this.showModal('历史数据回显 (v' + version.version + ')', body, [
         { label: '关闭', cls: 'btn-secondary', action: function () { self.hideModal(); } }
       ]);
@@ -344,16 +406,41 @@
         if (!tplId || !recId) { self.toast('请选择模板和记录', 'error'); return; }
         var rec = FB.storage.getFormData(tplId, recId);
         if (!rec) { self.toast('数据不存在', 'error'); return; }
-        // Use the version the data was created against
-        var tpl = (rec.data._templateVersion) ?
-          (FB.storage.getTemplateVersion(tplId, rec.data._templateVersion) || FB.storage.getTemplateLatest(tplId)) :
-          FB.storage.getTemplateLatest(tplId);
-        if (!tpl) { self.toast('模板不存在', 'error'); return; }
 
-        var json = FB.io.exportData(tpl, rec.data);
-        $('#export-data-output').textContent = json;
-        FB.io.downloadFile(json, 'form_data_' + recId.slice(0, 8) + '.json', 'application/json');
-        self.toast('数据已导出', 'success');
+        var exportMode = 'original';
+        var modeRadios = document.querySelectorAll('input[name="export-view-mode"]');
+        for (var ri = 0; ri < modeRadios.length; ri++) {
+          if (modeRadios[ri].checked) { exportMode = modeRadios[ri].value; break; }
+        }
+
+        if (exportMode === 'migration') {
+          var latestTpl = FB.storage.getTemplateLatest(tplId);
+          if (!latestTpl) { self.toast('模板不存在', 'error'); return; }
+          var result = FB.io.exportDataMigrated(latestTpl, rec.data, tplId);
+          if (!result.success) {
+            self.toast('迁移失败: ' + result.error + '，已降级为原始视图导出', 'error');
+            // Fallback to original
+            var tpl = (rec.data._templateVersion) ?
+              (FB.storage.getTemplateVersion(tplId, rec.data._templateVersion) || latestTpl) : latestTpl;
+            var json = FB.io.exportData(tpl, rec.data);
+            $('#export-data-output').textContent = json;
+            FB.io.downloadFile(json, 'form_data_' + recId.slice(0, 8) + '_original.json', 'application/json');
+            return;
+          }
+          $('#export-data-output').textContent = result.data;
+          FB.io.downloadFile(result.data, 'form_data_' + recId.slice(0, 8) + '_migrated.json', 'application/json');
+          self.toast('迁移视图数据已导出', 'success');
+        } else {
+          // Original mode
+          var tpl = (rec.data._templateVersion) ?
+            (FB.storage.getTemplateVersion(tplId, rec.data._templateVersion) || FB.storage.getTemplateLatest(tplId)) :
+            FB.storage.getTemplateLatest(tplId);
+          if (!tpl) { self.toast('模板不存在', 'error'); return; }
+          var json = FB.io.exportData(tpl, rec.data);
+          $('#export-data-output').textContent = json;
+          FB.io.downloadFile(json, 'form_data_' + recId.slice(0, 8) + '.json', 'application/json');
+          self.toast('数据已导出', 'success');
+        }
       });
 
       $('#btn-export-data-csv').addEventListener('click', function () {
@@ -362,16 +449,39 @@
         if (!tplId || !recId) { self.toast('请选择模板和记录', 'error'); return; }
         var rec = FB.storage.getFormData(tplId, recId);
         if (!rec) { self.toast('数据不存在', 'error'); return; }
-        // Use the version the data was created against
-        var tpl = (rec.data._templateVersion) ?
-          (FB.storage.getTemplateVersion(tplId, rec.data._templateVersion) || FB.storage.getTemplateLatest(tplId)) :
-          FB.storage.getTemplateLatest(tplId);
-        if (!tpl) { self.toast('模板不存在', 'error'); return; }
 
-        var csv = FB.io.exportDataCSV(tpl, rec.data);
-        $('#export-data-output').textContent = csv;
-        FB.io.downloadFile(csv, 'form_data_' + recId.slice(0, 8) + '.csv', 'text/csv');
-        self.toast('CSV 已导出', 'success');
+        var exportMode = 'original';
+        var modeRadios = document.querySelectorAll('input[name="export-view-mode"]');
+        for (var ri = 0; ri < modeRadios.length; ri++) {
+          if (modeRadios[ri].checked) { exportMode = modeRadios[ri].value; break; }
+        }
+
+        if (exportMode === 'migration') {
+          var latestTpl = FB.storage.getTemplateLatest(tplId);
+          if (!latestTpl) { self.toast('模板不存在', 'error'); return; }
+          var result = FB.io.exportDataCSVMigrated(latestTpl, rec.data, tplId);
+          if (!result.success) {
+            self.toast('迁移失败: ' + result.error + '，已降级为原始视图导出', 'error');
+            var tpl = (rec.data._templateVersion) ?
+              (FB.storage.getTemplateVersion(tplId, rec.data._templateVersion) || latestTpl) : latestTpl;
+            var csv = FB.io.exportDataCSV(tpl, rec.data);
+            $('#export-data-output').textContent = csv;
+            FB.io.downloadFile(csv, 'form_data_' + recId.slice(0, 8) + '_original.csv', 'text/csv');
+            return;
+          }
+          $('#export-data-output').textContent = result.csv;
+          FB.io.downloadFile(result.csv, 'form_data_' + recId.slice(0, 8) + '_migrated.csv', 'text/csv');
+          self.toast('迁移视图 CSV 已导出', 'success');
+        } else {
+          var tpl = (rec.data._templateVersion) ?
+            (FB.storage.getTemplateVersion(tplId, rec.data._templateVersion) || FB.storage.getTemplateLatest(tplId)) :
+            FB.storage.getTemplateLatest(tplId);
+          if (!tpl) { self.toast('模板不存在', 'error'); return; }
+          var csv = FB.io.exportDataCSV(tpl, rec.data);
+          $('#export-data-output').textContent = csv;
+          FB.io.downloadFile(csv, 'form_data_' + recId.slice(0, 8) + '.csv', 'text/csv');
+          self.toast('CSV 已导出', 'success');
+        }
       });
     },
 
@@ -446,6 +556,48 @@
         if (fields[i].subFields) this._ensureFieldIds(fields[i].subFields);
         if (fields[i].children) this._ensureFieldIds(fields[i].children);
       }
+    },
+
+    _showMigrationConfigEditor: function (templateId, fromVersion, toVersion) {
+      var self = this;
+      var oldTpl = FB.storage.getTemplateVersion(templateId, fromVersion);
+      var newTpl = FB.storage.getTemplateVersion(templateId, toVersion);
+      if (!oldTpl || !newTpl) { self.toast('版本不存在', 'error'); return; }
+
+      var diff = FB.migration.diffTemplates(oldTpl, newTpl);
+      var suggestions = FB.migration.detectFieldCorrespondence(oldTpl, newTpl);
+
+      var body = document.createElement('div');
+      var info = document.createElement('div');
+      info.style.cssText = 'margin-bottom:12px;font-size:13px;color:#666;';
+      info.textContent = '为 v' + fromVersion + ' → v' + toVersion + ' 配置迁移规则';
+      body.appendChild(info);
+
+      // Use a temporary Designer-like object to build the mapping UI
+      var tempDesigner = { template: newTpl };
+      var ruleUI = FB.Designer.prototype._buildMappingRuleUI.call(tempDesigner, suggestions, diff);
+      body.appendChild(ruleUI);
+
+      self.showModal('编辑迁移规则', body, [
+        { label: '取消', cls: 'btn-secondary', action: function () { self.hideModal(); } },
+        {
+          label: '保存',
+          cls: 'btn-primary',
+          action: function () {
+            var config = FB.Designer.prototype._collectMappingConfig.call(tempDesigner, ruleUI);
+            if (config) {
+              config.templateId = templateId;
+              config.fromVersion = fromVersion;
+              config.toVersion = toVersion;
+              FB.storage.saveMigrationConfig(templateId, toVersion, config);
+              self.toast('迁移规则已保存', 'success');
+            } else {
+              self.toast('未配置任何规则', 'error');
+            }
+            self.hideModal();
+          }
+        }
+      ]);
     },
 
     /* ========== Modal ========== */

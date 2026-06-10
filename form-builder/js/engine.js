@@ -174,6 +174,30 @@
         if (all[i].recordId !== recordId) filtered.push(all[i]);
       }
       this.set('data_' + templateId, filtered);
+    },
+    // Migration config CRUD
+    saveMigrationConfig: function (templateId, version, config) {
+      this.set('migration_' + templateId + '_' + version, config);
+    },
+    getMigrationConfig: function (templateId, version) {
+      return this.get('migration_' + templateId + '_' + version);
+    },
+    getAllMigrationConfigs: function (templateId) {
+      var configs = [];
+      var versions = this.getTemplateVersions(templateId);
+      for (var i = 1; i < versions.length; i++) {
+        var cfg = this.getMigrationConfig(templateId, versions[i].version);
+        if (cfg) configs.push(cfg);
+      }
+      return configs;
+    },
+    appendMigrationLog: function (templateId, logEntry) {
+      var logs = this.getMigrationLogs(templateId);
+      logs.push(logEntry);
+      this.set('migration_log_' + templateId, logs);
+    },
+    getMigrationLogs: function (templateId) {
+      return this.get('migration_log_' + templateId) || [];
     }
   };
 
@@ -671,6 +695,68 @@
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
+    },
+
+    exportDataMigrated: function (latestTpl, originalData, templateId) {
+      var migrated = FB.migration.applyMigrationView(originalData, templateId, latestTpl.version);
+      if (migrated._migrationFailed) {
+        return { success: false, error: migrated.error, data: null };
+      }
+      return {
+        success: true,
+        data: JSON.stringify({
+          _system: 'gov-form-builder',
+          _exportVersion: 1,
+          _exportMode: 'migration',
+          _migratedFrom: originalData._templateVersion,
+          _migratedTo: latestTpl.version,
+          templateId: latestTpl.id,
+          templateName: latestTpl.name,
+          templateVersion: latestTpl.version,
+          data: migrated,
+          exportedAt: FB.util.now()
+        }, null, 2)
+      };
+    },
+
+    exportDataCSVMigrated: function (latestTpl, originalData, templateId) {
+      var migrated = FB.migration.applyMigrationView(originalData, templateId, latestTpl.version);
+      if (migrated._migrationFailed) {
+        return { success: false, error: migrated.error, csv: null };
+      }
+      return { success: true, csv: this.exportDataCSV(latestTpl, migrated) };
+    },
+
+    exportAllDataJSON: function (templateId, mode) {
+      var allData = this.getFormDataAll(templateId);
+      var tpl = this.getTemplateLatest(templateId);
+      if (!tpl) return JSON.stringify({ error: 'template not found' });
+      var records = [];
+      for (var i = 0; i < allData.length; i++) {
+        var rec = allData[i];
+        if (mode === 'migration' && rec.data._templateVersion && rec.data._templateVersion < tpl.version) {
+          var migrated = FB.migration.applyMigrationView(rec.data, templateId, tpl.version);
+          records.push({
+            recordId: rec.recordId,
+            data: migrated._migrationFailed ? rec.data : migrated,
+            _migrationStatus: migrated._migrationFailed ? 'failed' : 'migrated',
+            savedAt: rec.savedAt
+          });
+        } else {
+          records.push(rec);
+        }
+      }
+      return JSON.stringify({
+        _system: 'gov-form-builder',
+        _exportVersion: 1,
+        _exportMode: mode || 'original',
+        templateId: tpl.id,
+        templateName: tpl.name,
+        templateVersion: tpl.version,
+        recordCount: records.length,
+        records: records,
+        exportedAt: FB.util.now()
+      }, null, 2);
     }
   };
 
@@ -853,6 +939,771 @@
           }
         }
       }
+    }
+  };
+
+  /* =========================================================
+     9. Migration Engine
+     ========================================================= */
+  FB.migration = {
+    /**
+     * Flatten all fields (including group children and table subFields)
+     * into a flat map keyed by field ID.
+     */
+    flattenFields: function (fields, includeDeleted) {
+      var map = {};
+      var walk = function (arr) {
+        for (var i = 0; i < arr.length; i++) {
+          var f = arr[i];
+          if (!includeDeleted && f._deleted) continue;
+          map[f.id] = f;
+          if (f.type === 'group' && f.children) walk(f.children);
+          if (f.type === 'table' && f.subFields) {
+            for (var j = 0; j < f.subFields.length; j++) {
+              if (!includeDeleted && f.subFields[j]._deleted) continue;
+              map[f.subFields[j].id] = f.subFields[j];
+            }
+          }
+        }
+      };
+      walk(fields);
+      return map;
+    },
+
+    /**
+     * Compute a detailed diff between two template snapshots.
+     */
+    diffTemplates: function (oldTpl, newTpl) {
+      var oldFields = this.flattenFields(oldTpl.fields, false);
+      var newFields = this.flattenFields(newTpl.fields, false);
+      var newAll = this.flattenFields(newTpl.fields, true);
+
+      var result = {
+        added: [], deleted: [], renamed: [], typeChanged: [],
+        optionsChanged: [], conditionsChanged: [], reordered: [],
+        subFieldChanges: [],
+        summary: { totalChanges: 0, breakingChanges: 0, nonBreakingChanges: 0 }
+      };
+
+      // Added: in new but not in old (and not _deleted)
+      for (var nid in newFields) {
+        if (!oldFields[nid] && !newFields[nid]._deleted) {
+          result.added.push({ id: nid, label: newFields[nid].label, type: newFields[nid].type, field: newFields[nid] });
+        }
+      }
+
+      // Deleted: in old but not in new, or present in newAll with _deleted that was active in old
+      for (var oid in oldFields) {
+        if (!newFields[oid]) {
+          if (newAll[oid] && newAll[oid]._deleted) {
+            result.deleted.push({ id: oid, label: oldFields[oid].label, type: oldFields[oid].type, field: oldFields[oid] });
+          } else if (!newAll[oid]) {
+            result.deleted.push({ id: oid, label: oldFields[oid].label, type: oldFields[oid].type, field: oldFields[oid] });
+          }
+        }
+      }
+
+      // Also detect newly-deleted fields (present in both but _deleted in new, not in old)
+      for (var did in newAll) {
+        if (newAll[did]._deleted && oldFields[did] && !oldFields[did]._deleted && !newFields[did]) {
+          // Already captured above in the deleted loop
+        }
+      }
+
+      // Changes for fields present in both
+      for (var bid in oldFields) {
+        if (!newFields[bid]) continue;
+        var of = oldFields[bid];
+        var nf = newFields[bid];
+
+        // Renamed
+        if (of.label.trim() !== nf.label.trim()) {
+          result.renamed.push({ id: bid, oldLabel: of.label, newLabel: nf.label, field: nf });
+        }
+
+        // Type changed
+        if (of.type !== nf.type) {
+          result.typeChanged.push({ id: bid, oldType: of.type, newType: nf.type, field: nf });
+        }
+
+        // Options changed (radio/checkbox)
+        if ((of.type === 'radio' || of.type === 'checkbox') && of.options && nf.options) {
+          var oldOpts = {};
+          for (var oi = 0; oi < of.options.length; oi++) oldOpts[of.options[oi].value] = of.options[oi];
+          var newOpts = {};
+          for (var ni = 0; ni < nf.options.length; ni++) newOpts[nf.options[ni].value] = nf.options[ni];
+
+          var addedOpts = [], removedOpts = [], renamedOpts = [];
+          for (var nv in newOpts) {
+            if (!oldOpts[nv]) {
+              addedOpts.push({ label: newOpts[nv].label, value: nv });
+            }
+          }
+          for (var ov in oldOpts) {
+            if (!newOpts[ov]) {
+              removedOpts.push({ label: oldOpts[ov].label, value: ov });
+            }
+          }
+          // Check for label renames (same value, different label)
+          for (var cv in oldOpts) {
+            if (newOpts[cv] && oldOpts[cv].label !== newOpts[cv].label) {
+              renamedOpts.push({ oldLabel: oldOpts[cv].label, oldValue: cv, newLabel: newOpts[cv].label, newValue: cv });
+            }
+          }
+          if (addedOpts.length || removedOpts.length || renamedOpts.length) {
+            result.optionsChanged.push({
+              id: bid, label: nf.label, type: nf.type,
+              addedOptions: addedOpts, removedOptions: removedOpts, renamedOptions: renamedOpts
+            });
+          }
+        }
+
+        // Conditions changed
+        var oldCondStr = JSON.stringify(of.conditions || []);
+        var newCondStr = JSON.stringify(nf.conditions || []);
+        if (oldCondStr !== newCondStr) {
+          result.conditionsChanged.push({
+            id: bid, label: nf.label,
+            oldConditions: of.conditions || [],
+            newConditions: nf.conditions || []
+          });
+        }
+      }
+
+      // Reordered: compare position of shared fields
+      var oldOrder = this._getFieldOrder(oldTpl.fields);
+      var newOrder = this._getFieldOrder(newTpl.fields);
+      var oldPosMap = {};
+      for (var pi = 0; pi < oldOrder.length; pi++) oldPosMap[oldOrder[pi]] = pi;
+      for (var qi = 0; qi < newOrder.length; qi++) {
+        var fid = newOrder[qi];
+        if (oldPosMap[fid] !== undefined && oldPosMap[fid] !== qi) {
+          var lbl = newFields[fid] ? newFields[fid].label : (oldFields[fid] ? oldFields[fid].label : fid);
+          result.reordered.push({ id: fid, label: lbl, oldIndex: oldPosMap[fid], newIndex: qi });
+        }
+      }
+
+      // SubField changes for table fields in both
+      for (var tid in oldFields) {
+        if (!newFields[tid]) continue;
+        if (oldFields[tid].type !== 'table' || !oldFields[tid].subFields || !newFields[tid].subFields) continue;
+        var oldSF = {};
+        for (var si = 0; si < oldFields[tid].subFields.length; si++) {
+          if (!oldFields[tid].subFields[si]._deleted) oldSF[oldFields[tid].subFields[si].id] = oldFields[tid].subFields[si];
+        }
+        var newSF = {};
+        for (var sj = 0; sj < newFields[tid].subFields.length; sj++) {
+          if (!newFields[tid].subFields[sj]._deleted) newSF[newFields[tid].subFields[sj].id] = newFields[tid].subFields[sj];
+        }
+        var sfAdded = [], sfDeleted = [], sfRenamed = [];
+        for (var sn in newSF) {
+          if (!oldSF[sn]) sfAdded.push({ id: sn, label: newSF[sn].label, type: newSF[sn].type });
+        }
+        for (var so in oldSF) {
+          if (!newSF[so]) sfDeleted.push({ id: so, label: oldSF[so].label, type: oldSF[so].type });
+          else if (oldSF[so].label !== newSF[so].label) {
+            sfRenamed.push({ id: so, oldLabel: oldSF[so].label, newLabel: newSF[so].label });
+          }
+        }
+        if (sfAdded.length || sfDeleted.length || sfRenamed.length) {
+          result.subFieldChanges.push({
+            parentId: tid, parentLabel: newFields[tid].label,
+            added: sfAdded, deleted: sfDeleted, renamed: sfRenamed
+          });
+        }
+      }
+
+      // Compute summary
+      var breaking = result.deleted.length + result.typeChanged.length;
+      for (var ri = 0; ri < result.optionsChanged.length; ri++) {
+        breaking += result.optionsChanged[ri].removedOptions.length;
+      }
+      for (var ri2 = 0; ri2 < result.subFieldChanges.length; ri2++) {
+        breaking += result.subFieldChanges[ri2].deleted.length;
+      }
+      var total = result.added.length + result.deleted.length + result.renamed.length +
+        result.typeChanged.length + result.optionsChanged.length +
+        result.conditionsChanged.length + result.reordered.length;
+      for (var ri3 = 0; ri3 < result.subFieldChanges.length; ri3++) {
+        total += result.subFieldChanges[ri3].added.length +
+          result.subFieldChanges[ri3].deleted.length + result.subFieldChanges[ri3].renamed.length;
+      }
+      result.summary = {
+        totalChanges: total,
+        breakingChanges: breaking,
+        nonBreakingChanges: total - breaking
+      };
+
+      return result;
+    },
+
+    /** Extract ordered list of non-deleted field IDs from a fields array */
+    _getFieldOrder: function (fields) {
+      var order = [];
+      var walk = function (arr) {
+        for (var i = 0; i < arr.length; i++) {
+          if (arr[i]._deleted) continue;
+          order.push(arr[i].id);
+          if (arr[i].type === 'group' && arr[i].children) walk(arr[i].children);
+        }
+      };
+      walk(fields);
+      return order;
+    },
+
+    /**
+     * Heuristic: auto-suggest mapping rules based on deleted + added fields.
+     */
+    detectFieldCorrespondence: function (oldTpl, newTpl) {
+      var suggestions = [];
+      var diff = this.diffTemplates(oldTpl, newTpl);
+      var deletedFields = diff.deleted;
+      var addedFields = diff.added;
+
+      // Try to match deleted → added by type + label similarity
+      var usedAdded = {};
+      for (var di = 0; di < deletedFields.length; di++) {
+        var df = deletedFields[di];
+        var bestMatch = null;
+        var bestScore = 0;
+        for (var ai = 0; ai < addedFields.length; ai++) {
+          if (usedAdded[ai]) continue;
+          var af = addedFields[ai];
+          if (df.type !== af.type) continue;
+          var score = this._labelSimilarity(df.label, af.label);
+          if (score > 0.6 && score > bestScore) {
+            bestScore = score;
+            bestMatch = ai;
+          }
+        }
+        if (bestMatch !== null) {
+          usedAdded[bestMatch] = true;
+          suggestions.push({
+            type: 'field_merge',
+            sourceFieldIds: [df.id],
+            sourceLabels: [df.label],
+            targetFieldId: addedFields[bestMatch].id,
+            targetLabel: addedFields[bestMatch].label,
+            mergeStrategy: 'concatenate',
+            mergeOptions: { separator: ' ' }
+          });
+        }
+      }
+
+      // Enum rename suggestions from optionsChanged
+      for (var oi = 0; oi < diff.optionsChanged.length; oi++) {
+        var oc = diff.optionsChanged[oi];
+        if (oc.removedOptions.length > 0 && oc.addedOptions.length > 0) {
+          var mappings = [];
+          var maxPairs = Math.min(oc.removedOptions.length, oc.addedOptions.length);
+          for (var pi = 0; pi < maxPairs; pi++) {
+            mappings.push({
+              oldValue: oc.removedOptions[pi].value,
+              oldLabel: oc.removedOptions[pi].label,
+              newValue: oc.addedOptions[pi].value,
+              newLabel: oc.addedOptions[pi].label
+            });
+          }
+          if (mappings.length > 0) {
+            suggestions.push({
+              type: 'enum_rename',
+              fieldId: oc.id,
+              fieldLabel: oc.label,
+              mappings: mappings
+            });
+          }
+        }
+        // Also suggest for renamed options
+        if (oc.renamedOptions.length > 0) {
+          var renameMappings = [];
+          for (var ri = 0; ri < oc.renamedOptions.length; ri++) {
+            renameMappings.push({
+              oldValue: oc.renamedOptions[ri].oldValue,
+              oldLabel: oc.renamedOptions[ri].oldLabel,
+              newValue: oc.renamedOptions[ri].newValue,
+              newLabel: oc.renamedOptions[ri].newLabel
+            });
+          }
+          suggestions.push({
+            type: 'enum_rename',
+            fieldId: oc.id,
+            fieldLabel: oc.label,
+            mappings: renameMappings
+          });
+        }
+      }
+
+      // Attachment preserve suggestions for deleted attachment fields
+      for (var di2 = 0; di2 < deletedFields.length; di2++) {
+        if (deletedFields[di2].type === 'attachment') {
+          suggestions.push({
+            type: 'attachment_preserve',
+            fieldId: deletedFields[di2].id,
+            fieldLabel: deletedFields[di2].label,
+            preserveAs: 'archive',
+            migrateToFieldId: null
+          });
+        }
+      }
+
+      return suggestions;
+    },
+
+    /** Character bigram Jaccard similarity between two strings */
+    _labelSimilarity: function (a, b) {
+      if (!a || !b) return 0;
+      var bigrams = function (s) {
+        var set = {};
+        for (var i = 0; i < s.length - 1; i++) set[s.substring(i, i + 2)] = true;
+        return set;
+      };
+      var ba = bigrams(a);
+      var bb = bigrams(b);
+      var intersection = 0;
+      for (var k in ba) if (bb[k]) intersection++;
+      var union = 0;
+      for (var k2 in ba) union++;
+      for (var k3 in bb) if (!ba[k3]) union++;
+      return union === 0 ? 0 : intersection / union;
+    },
+
+    /**
+     * Apply migration rules to a single data record.
+     */
+    executeMigration: function (config, data, oldTpl, newTpl) {
+      var migratedData = FB.util.deepClone(data);
+      var appliedRules = [];
+      var skippedRules = [];
+      var errors = [];
+      var warnings = [];
+
+      try {
+        var rules = config.rules || [];
+        for (var i = 0; i < rules.length; i++) {
+          var rule = rules[i];
+          if (!rule.enabled) { skippedRules.push(rule.ruleId); continue; }
+
+          try {
+            if (rule.type === 'field_merge') {
+              var parts = [];
+              for (var si = 0; si < rule.sourceFieldIds.length; si++) {
+                var sv = migratedData[rule.sourceFieldIds[si]];
+                if (sv !== undefined && sv !== null && sv !== '') {
+                  parts.push(String(sv));
+                }
+                delete migratedData[rule.sourceFieldIds[si]];
+              }
+              if (rule.mergeStrategy === 'concatenate') {
+                var sep = (rule.mergeOptions && rule.mergeOptions.separator) || ' ';
+                migratedData[rule.targetFieldId] = parts.join(sep);
+              } else if (rule.mergeStrategy === 'take_first') {
+                migratedData[rule.targetFieldId] = parts.length > 0 ? parts[0] : '';
+              } else if (rule.mergeStrategy === 'take_last') {
+                migratedData[rule.targetFieldId] = parts.length > 0 ? parts[parts.length - 1] : '';
+              }
+              appliedRules.push(rule.ruleId);
+
+            } else if (rule.type === 'enum_rename') {
+              var fieldVal = migratedData[rule.fieldId];
+              if (fieldVal !== undefined && fieldVal !== null) {
+                var mappingMap = {};
+                for (var mi = 0; mi < rule.mappings.length; mi++) {
+                  mappingMap[rule.mappings[mi].oldValue] = rule.mappings[mi].newValue;
+                }
+                if (Array.isArray(fieldVal)) {
+                  // checkbox
+                  for (var ci = 0; ci < fieldVal.length; ci++) {
+                    if (mappingMap[fieldVal[ci]] !== undefined) fieldVal[ci] = mappingMap[fieldVal[ci]];
+                  }
+                } else {
+                  // radio
+                  if (mappingMap[fieldVal] !== undefined) {
+                    migratedData[rule.fieldId] = mappingMap[fieldVal];
+                  }
+                }
+              }
+              appliedRules.push(rule.ruleId);
+
+            } else if (rule.type === 'attachment_preserve') {
+              var attachVal = migratedData[rule.fieldId];
+              if (attachVal !== undefined && attachVal !== null && attachVal !== '') {
+                if (rule.preserveAs === 'archive') {
+                  migratedData['_archived_' + rule.fieldId] = attachVal;
+                  warnings.push({ ruleId: rule.ruleId, message: '附件字段数据已保留为归档' });
+                } else if (rule.preserveAs === 'migrate_to' && rule.migrateToFieldId) {
+                  migratedData[rule.migrateToFieldId] = attachVal;
+                }
+              }
+              appliedRules.push(rule.ruleId);
+            }
+          } catch (ruleErr) {
+            errors.push({ ruleId: rule.ruleId, message: ruleErr.message });
+          }
+        }
+
+        migratedData._migratedFrom = data._templateVersion || 0;
+        migratedData._migratedTo = config.toVersion || 0;
+        migratedData._migratedAt = FB.util.now();
+
+        var logEntry = {
+          logId: FB.util.uid(),
+          templateId: config.templateId,
+          fromVersion: config.fromVersion,
+          toVersion: config.toVersion,
+          recordId: data._recordId || 'unknown',
+          status: errors.length > 0 ? 'failed' : 'success',
+          error: errors.length > 0 ? errors[0].message : null,
+          originalData: FB.util.deepClone(data),
+          timestamp: FB.util.now()
+        };
+        FB.storage.appendMigrationLog(config.templateId, logEntry);
+
+        return {
+          success: errors.length === 0,
+          recordId: data._recordId || 'unknown',
+          fromVersion: config.fromVersion,
+          toVersion: config.toVersion,
+          migratedData: migratedData,
+          appliedRules: appliedRules,
+          skippedRules: skippedRules,
+          errors: errors,
+          warnings: warnings
+        };
+      } catch (e) {
+        var failEntry = {
+          logId: FB.util.uid(),
+          templateId: config.templateId,
+          fromVersion: config.fromVersion,
+          toVersion: config.toVersion,
+          recordId: data._recordId || 'unknown',
+          status: 'failed',
+          error: e.message,
+          originalData: FB.util.deepClone(data),
+          timestamp: FB.util.now()
+        };
+        FB.storage.appendMigrationLog(config.templateId, failEntry);
+
+        return {
+          success: false,
+          recordId: data._recordId || 'unknown',
+          fromVersion: config.fromVersion,
+          toVersion: config.toVersion,
+          migratedData: null,
+          appliedRules: appliedRules,
+          skippedRules: skippedRules,
+          errors: [{ ruleId: null, message: e.message }],
+          warnings: warnings
+        };
+      }
+    },
+
+    /**
+     * Rollback: return the pre-migration snapshot from a log entry.
+     */
+    rollbackMigration: function (logEntry) {
+      return FB.util.deepClone(logEntry.originalData);
+    },
+
+    /**
+     * Chain-apply all migration configs from data._templateVersion up to targetVersion.
+     */
+    applyMigrationView: function (data, templateId, targetVersion) {
+      var versions = FB.storage.getTemplateVersions(templateId);
+      var fromVer = data._templateVersion || 1;
+      if (fromVer >= targetVersion) return FB.util.deepClone(data);
+
+      var currentData = FB.util.deepClone(data);
+      for (var i = 0; i < versions.length; i++) {
+        var ver = versions[i].version;
+        if (ver <= fromVer) continue;
+        if (ver > targetVersion) break;
+
+        var config = FB.storage.getMigrationConfig(templateId, ver);
+        if (!config) continue; // No migration config for this version, skip
+
+        var prevTpl = FB.storage.getTemplateVersion(templateId, ver - 1);
+        var curTpl = versions[i];
+        var result = this.executeMigration(config, currentData, prevTpl, curTpl);
+        if (!result.success) {
+          return {
+            _migrationFailed: true,
+            error: result.errors.length > 0 ? result.errors[0].message : 'Migration failed',
+            failedAtVersion: ver,
+            originalData: FB.util.deepClone(data)
+          };
+        }
+        currentData = result.migratedData;
+      }
+      return currentData;
+    }
+  };
+
+  /* =========================================================
+     10. Impact Assessment
+     ========================================================= */
+  FB.impact = {
+    /**
+     * Assess the impact of template changes on historical data.
+     */
+    assess: function (diff, templateId) {
+      var allRecords = FB.storage.getFormDataAll(templateId);
+      var submittedRecords = [];
+      for (var i = 0; i < allRecords.length; i++) {
+        if (!allRecords[i].data._draft) submittedRecords.push(allRecords[i]);
+      }
+
+      var changes = [];
+      var allAffectedIds = {};
+
+      // Deleted fields
+      for (var di = 0; di < diff.deleted.length; di++) {
+        var d = diff.deleted[di];
+        var affected = this._countAffected(submittedRecords, d.id);
+        var sample = this._getSample(submittedRecords, d.id, 3);
+        for (var si = 0; si < affected.recordIds.length; si++) allAffectedIds[affected.recordIds[si]] = true;
+        changes.push({
+          changeType: 'deleted',
+          fieldId: d.id,
+          fieldLabel: d.label,
+          severity: affected.count > 0 ? 'high' : 'info',
+          affectedRecords: affected.count,
+          affectedSample: sample,
+          description: '字段「' + d.label + '」将被删除，' + affected.count + ' 条历史数据中该字段值将归档显示',
+          recommendation: affected.count > 0 ? '建议配置字段合并规则，将旧数据映射到新字段' : ''
+        });
+      }
+
+      // Type changed fields
+      for (var ti = 0; ti < diff.typeChanged.length; ti++) {
+        var tc = diff.typeChanged[ti];
+        var tAffected = this._countAffected(submittedRecords, tc.id);
+        var tSample = this._getSample(submittedRecords, tc.id, 3);
+        for (var tsi = 0; tsi < tAffected.recordIds.length; tsi++) allAffectedIds[tAffected.recordIds[tsi]] = true;
+        changes.push({
+          changeType: 'typeChanged',
+          fieldId: tc.id,
+          fieldLabel: diff.typeChanged[ti].field ? diff.typeChanged[ti].field.label : tc.id,
+          severity: tAffected.count > 0 ? 'high' : 'info',
+          affectedRecords: tAffected.count,
+          affectedSample: tSample,
+          description: '字段类型从「' + tc.oldType + '」变更为「' + tc.newType + '」，' + tAffected.count + ' 条数据格式可能不兼容',
+          recommendation: tAffected.count > 0 ? '建议检查历史数据类型兼容性' : ''
+        });
+      }
+
+      // Options changed
+      for (var oi = 0; oi < diff.optionsChanged.length; oi++) {
+        var oc = diff.optionsChanged[oi];
+        for (var roi = 0; roi < oc.removedOptions.length; roi++) {
+          var optAffected = this._countByOptionValue(submittedRecords, oc.id, oc.removedOptions[roi].value);
+          for (var osi = 0; osi < optAffected.recordIds.length; osi++) allAffectedIds[optAffected.recordIds[osi]] = true;
+          changes.push({
+            changeType: 'optionsRemoved',
+            fieldId: oc.id,
+            fieldLabel: oc.label,
+            severity: optAffected.count > 0 ? 'medium' : 'info',
+            affectedRecords: optAffected.count,
+            affectedSample: optAffected.samples,
+            description: '字段「' + oc.label + '」移除了选项「' + oc.removedOptions[roi].label + '」，' + optAffected.count + ' 条数据使用该选项',
+            recommendation: optAffected.count > 0 ? '建议配置枚举值重命名规则' : ''
+          });
+        }
+      }
+
+      // Renamed fields
+      for (var ri = 0; ri < diff.renamed.length; ri++) {
+        var rn = diff.renamed[ri];
+        var rnAffected = this._countAffected(submittedRecords, rn.id);
+        for (var rsi = 0; rsi < rnAffected.recordIds.length; rsi++) allAffectedIds[rnAffected.recordIds[rsi]] = true;
+        changes.push({
+          changeType: 'renamed',
+          fieldId: rn.id,
+          fieldLabel: rn.newLabel,
+          severity: 'low',
+          affectedRecords: submittedRecords.length,
+          affectedSample: [],
+          description: '字段标签从「' + rn.oldLabel + '」重命名为「' + rn.newLabel + '」',
+          recommendation: ''
+        });
+      }
+
+      // Conditions changed
+      for (var ci = 0; ci < diff.conditionsChanged.length; ci++) {
+        var cc = diff.conditionsChanged[ci];
+        changes.push({
+          changeType: 'conditionsChanged',
+          fieldId: cc.id,
+          fieldLabel: cc.label,
+          severity: 'low',
+          affectedRecords: submittedRecords.length,
+          affectedSample: [],
+          description: '字段「' + cc.label + '」的条件显隐规则已变更',
+          recommendation: ''
+        });
+      }
+
+      // Reordered (info only)
+      if (diff.reordered.length > 0) {
+        changes.push({
+          changeType: 'reordered',
+          fieldId: null,
+          fieldLabel: '',
+          severity: 'info',
+          affectedRecords: 0,
+          affectedSample: [],
+          description: diff.reordered.length + ' 个字段的位置已调整',
+          recommendation: ''
+        });
+      }
+
+      // Added fields (info)
+      if (diff.added.length > 0) {
+        changes.push({
+          changeType: 'added',
+          fieldId: null,
+          fieldLabel: '',
+          severity: 'info',
+          affectedRecords: 0,
+          affectedSample: [],
+          description: '新增了 ' + diff.added.length + ' 个字段，历史数据中这些字段将为空',
+          recommendation: ''
+        });
+      }
+
+      // SubField changes
+      for (var sfi = 0; sfi < diff.subFieldChanges.length; sfi++) {
+        var sfc = diff.subFieldChanges[sfi];
+        for (var sdi = 0; sdi < sfc.deleted.length; sdi++) {
+          changes.push({
+            changeType: 'subFieldDeleted',
+            fieldId: sfc.deleted[sdi].id,
+            fieldLabel: sfc.deleted[sdi].label,
+            severity: 'medium',
+            affectedRecords: submittedRecords.length,
+            affectedSample: [],
+            description: '明细表「' + sfc.parentLabel + '」中的列「' + sfc.deleted[sdi].label + '」已删除',
+            recommendation: '建议配置子字段映射规则'
+          });
+        }
+      }
+
+      // Compute totals
+      var totalHigh = 0, totalMedium = 0, totalLow = 0;
+      for (var xi = 0; xi < changes.length; xi++) {
+        if (changes[xi].severity === 'high') totalHigh++;
+        else if (changes[xi].severity === 'medium') totalMedium++;
+        else if (changes[xi].severity === 'low') totalLow++;
+      }
+      var affectedIdList = [];
+      for (var aid in allAffectedIds) affectedIdList.push(aid);
+
+      return {
+        changes: changes,
+        totalAffectedRecords: affectedIdList.length,
+        totalHighSeverity: totalHigh,
+        totalMediumSeverity: totalMedium,
+        totalLowSeverity: totalLow,
+        hasBreakingChanges: diff.summary.breakingChanges > 0
+      };
+    },
+
+    _countAffected: function (records, fieldId) {
+      var count = 0;
+      var ids = [];
+      for (var i = 0; i < records.length; i++) {
+        var v = records[i].data[fieldId];
+        if (v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && v.length === 0)) {
+          count++;
+          ids.push(records[i].recordId);
+        }
+      }
+      return { count: count, recordIds: ids };
+    },
+
+    _getSample: function (records, fieldId, maxCount) {
+      var samples = [];
+      for (var i = 0; i < records.length && samples.length < maxCount; i++) {
+        var v = records[i].data[fieldId];
+        if (v !== undefined && v !== null && v !== '') {
+          var display = typeof v === 'object' ? JSON.stringify(v) : String(v);
+          if (display.length > 50) display = display.substring(0, 50) + '...';
+          samples.push({ recordId: records[i].recordId, value: display });
+        }
+      }
+      return samples;
+    },
+
+    _countByOptionValue: function (records, fieldId, optionValue) {
+      var count = 0;
+      var ids = [];
+      var samples = [];
+      for (var i = 0; i < records.length; i++) {
+        var v = records[i].data[fieldId];
+        var match = false;
+        if (Array.isArray(v)) {
+          for (var j = 0; j < v.length; j++) {
+            if (v[j] === optionValue) { match = true; break; }
+          }
+        } else if (v === optionValue) {
+          match = true;
+        }
+        if (match) {
+          count++;
+          ids.push(records[i].recordId);
+          if (samples.length < 3) {
+            samples.push({ recordId: records[i].recordId, value: String(v) });
+          }
+        }
+      }
+      return { count: count, recordIds: ids, samples: samples };
+    },
+
+    /**
+     * Generate an HTML report of the impact assessment.
+     */
+    generateReport: function (impactResult, diff) {
+      var html = '';
+      // Summary banner
+      var bannerClass = impactResult.hasBreakingChanges ? 'impact-summary-banner has-breaking' : 'impact-summary-banner no-breaking';
+      html += '<div class="' + bannerClass + '">';
+      html += '<strong>' + diff.summary.totalChanges + ' 项变更</strong> | ';
+      html += impactResult.totalAffectedRecords + ' 条数据受影响 | ';
+      html += impactResult.totalHighSeverity + ' 项高风险';
+      if (impactResult.totalMediumSeverity > 0) html += ' | ' + impactResult.totalMediumSeverity + ' 项中风险';
+      html += '</div>';
+
+      // Change list
+      html += '<div class="impact-change-list">';
+      for (var i = 0; i < impactResult.changes.length; i++) {
+        var c = impactResult.changes[i];
+        html += '<div class="impact-change-card severity-' + c.severity + '">';
+        html += '<div class="change-header">';
+        var typeLabels = {
+          deleted: '删除', typeChanged: '类型变更', optionsRemoved: '选项移除',
+          renamed: '重命名', conditionsChanged: '条件变更', reordered: '重排',
+          added: '新增', subFieldDeleted: '子字段删除'
+        };
+        html += '<span class="change-type-badge">' + (typeLabels[c.changeType] || c.changeType) + '</span>';
+        if (c.fieldLabel) html += ' <strong>' + FB.util.escapeHtml(c.fieldLabel) + '</strong>';
+        html += ' <span style="color:#999;font-size:11px;">' + c.affectedRecords + ' 条受影响</span>';
+        html += '</div>';
+        html += '<div class="change-description">' + FB.util.escapeHtml(c.description) + '</div>';
+        if (c.recommendation) {
+          html += '<div class="change-description" style="color:var(--primary);">💡 ' + FB.util.escapeHtml(c.recommendation) + '</div>';
+        }
+        if (c.affectedSample && c.affectedSample.length > 0) {
+          html += '<div class="change-sample">样本: ';
+          for (var si = 0; si < c.affectedSample.length; si++) {
+            html += FB.util.escapeHtml(c.affectedSample[si].recordId.slice(0, 8)) + '="' +
+              FB.util.escapeHtml(c.affectedSample[si].value) + '"';
+            if (si < c.affectedSample.length - 1) html += ', ';
+          }
+          html += '</div>';
+        }
+        html += '</div>';
+      }
+      html += '</div>';
+      return html;
     }
   };
 

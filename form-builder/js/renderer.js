@@ -25,10 +25,29 @@
       this.isPreview = !!opts.isPreview;
       this.recordId = opts.recordId || FB.util.uid();
       this._templateVersion = template.version;
+      this.migrationView = !!opts.migrationView;
+      this.migrationTargetVersion = opts.migrationTargetVersion || null;
+      this._migrationError = null;
+      this._migrationOriginalVersion = null;
 
       this.values = {};
       this._initDefaults(template.fields);
       if (initialData) {
+        // Apply migration if requested
+        if (this.migrationView && initialData._templateVersion &&
+            initialData._templateVersion < template.version &&
+            typeof FB.migration !== 'undefined') {
+          this._migrationOriginalVersion = initialData._templateVersion;
+          var migrated = FB.migration.applyMigrationView(
+            initialData, template.id,
+            this.migrationTargetVersion || template.version
+          );
+          if (migrated._migrationFailed) {
+            this._migrationError = migrated;
+          } else {
+            initialData = migrated;
+          }
+        }
         this.values = FB.compatibility.mergeDataWithTemplate(template, initialData);
       }
       this.values._templateVersion = this._templateVersion;
@@ -74,6 +93,13 @@
       meta.style.cssText = 'font-size:11px;color:#999;margin-bottom:20px;';
       meta.textContent = '模板版本: v' + this.template.version + ' | 记录ID: ' + this.recordId.slice(0, 12);
       form.appendChild(meta);
+
+      // Migration banners
+      if (this._migrationError) {
+        form.appendChild(this._showMigrationError(this._migrationError));
+      } else if (this.migrationView && this._migrationOriginalVersion) {
+        form.appendChild(this._renderMigrationBanner());
+      }
 
       // Show archived deleted field data
       var archivedFields = FB.compatibility.collectArchivedFields(this.template, this.values);
@@ -155,6 +181,27 @@
       this.container.appendChild(form);
       this._bindFormEvents(form);
       this._updateConditions();
+    },
+
+    _showMigrationError: function (result) {
+      var banner = document.createElement('div');
+      banner.className = 'migration-error-banner';
+      banner.innerHTML =
+        '<strong>⚠ 迁移失败</strong> — 数据迁移至 v' + this.template.version +
+        ' 时出错' + (result.failedAtVersion ? ' (v' + result.failedAtVersion + ')' : '') +
+        '：' + FB.util.escapeHtml(result.error || '未知错误') +
+        '<br><span style="font-size:11px;">已回退到原始版本数据显示</span>';
+      return banner;
+    },
+
+    _renderMigrationBanner: function () {
+      var banner = document.createElement('div');
+      banner.className = 'migration-view-banner';
+      banner.innerHTML =
+        '<span><span class="migration-badge">迁移视图</span>' +
+        '数据已从 v' + this._migrationOriginalVersion +
+        ' 迁移至 v' + this.template.version + ' 显示</span>';
+      return banner;
     },
 
     _renderFields: function (fields, parent) {
