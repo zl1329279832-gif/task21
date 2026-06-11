@@ -477,6 +477,7 @@
         if (el.dataset.tableField !== undefined && el.dataset.row !== undefined) {
           self._updateTableCell(el, el.dataset.tableField, Number(el.dataset.row));
         }
+        self._updateConditions();
       });
 
       // Change events (for select, radio, checkbox, file)
@@ -528,6 +529,8 @@
             }
           }
         }
+
+        self._updateConditions();
       });
 
       // Click events

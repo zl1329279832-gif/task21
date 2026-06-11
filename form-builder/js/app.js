@@ -156,7 +156,7 @@
 
       $('#btn-save-draft-fill').disabled = false;
       $('#btn-submit-fill').disabled = false;
-      var versionInfo = tpl.version ? ' (v' + tpl.version + ')' : '';
+      var versionInfo = template.version ? ' (v' + template.version + ')' : '';
       $('#fill-status').textContent = '填报中...' + versionInfo;
 
       if (this._autoSaveTimer) clearInterval(this._autoSaveTimer);
@@ -551,10 +551,39 @@
 
     _ensureFieldIds: function (fields) {
       if (!fields) return;
+      var idMap = {};
+      // First pass: assign new IDs where missing and record mapping
+      this._assignFieldIds(fields, idMap);
+      // Second pass: update condition references using the mapping
+      if (Object.keys(idMap).length > 0) {
+        this._updateConditionFieldRefs(fields, idMap);
+      }
+    },
+
+    _assignFieldIds: function (fields, idMap) {
       for (var i = 0; i < fields.length; i++) {
-        if (!fields[i].id) fields[i].id = FB.util.uid();
-        if (fields[i].subFields) this._ensureFieldIds(fields[i].subFields);
-        if (fields[i].children) this._ensureFieldIds(fields[i].children);
+        if (!fields[i].id) {
+          var newId = FB.util.uid();
+          idMap[''] = newId; // empty→new (won't help much, but tracks it)
+          fields[i].id = newId;
+        }
+        if (fields[i].subFields) this._assignFieldIds(fields[i].subFields, idMap);
+        if (fields[i].children) this._assignFieldIds(fields[i].children, idMap);
+      }
+    },
+
+    _updateConditionFieldRefs: function (fields, idMap) {
+      for (var i = 0; i < fields.length; i++) {
+        var f = fields[i];
+        if (f.conditions) {
+          for (var ci = 0; ci < f.conditions.length; ci++) {
+            var ref = f.conditions[ci].field;
+            if (ref && idMap[ref]) {
+              f.conditions[ci].field = idMap[ref];
+            }
+          }
+        }
+        if (f.children) this._updateConditionFieldRefs(f.children, idMap);
       }
     },
 

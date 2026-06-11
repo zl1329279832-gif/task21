@@ -980,6 +980,409 @@
     FB.TestRunner.assert(!!parsed.exportedAt, 'timestamp');
   });
 
+  // =========================================================
+  // Suite 13: Reorder + Undo
+  // =========================================================
+  FB.TestRunner.suite('Reorder + Undo');
+
+  FB.TestRunner.test('undo restores original field order', function () {
+    var fields = [makeField('f1', 'text', 'A'), makeField('f2', 'text', 'B'), makeField('f3', 'text', 'C')];
+    var um = new FB.UndoManager();
+    um.push(FB.util.deepClone(fields));
+    // Simulate reorder: move f3 to position 0
+    var moved = fields.splice(2, 1)[0];
+    fields.splice(0, 0, moved);
+    FB.TestRunner.assertEqual(fields[0].id, 'f3', 'reordered');
+    // Undo
+    var prev = um.undo(fields);
+    FB.TestRunner.assertEqual(prev[0].id, 'f1', 'undo pos 0');
+    FB.TestRunner.assertEqual(prev[1].id, 'f2', 'undo pos 1');
+    FB.TestRunner.assertEqual(prev[2].id, 'f3', 'undo pos 2');
+  });
+
+  FB.TestRunner.test('redo re-applies reorder', function () {
+    var fields = [makeField('f1', 'text', 'A'), makeField('f2', 'text', 'B')];
+    var um = new FB.UndoManager();
+    um.push(FB.util.deepClone(fields));
+    var moved = fields.splice(1, 1)[0];
+    fields.splice(0, 0, moved);
+    var prev = um.undo(fields);
+    FB.TestRunner.assertEqual(prev[0].id, 'f1', 'undone');
+    var next = um.redo(prev);
+    FB.TestRunner.assertEqual(next[0].id, 'f2', 'redone pos 0');
+    FB.TestRunner.assertEqual(next[1].id, 'f1', 'redone pos 1');
+  });
+
+  FB.TestRunner.test('multiple reorder undos restore each step', function () {
+    var fields = [makeField('f1', 'text', 'A'), makeField('f2', 'text', 'B'), makeField('f3', 'text', 'C')];
+    var um = new FB.UndoManager();
+    // Step 1: swap f1 and f2
+    um.push(FB.util.deepClone(fields));
+    var tmp = fields[0]; fields[0] = fields[1]; fields[1] = tmp;
+    // Step 2: swap f2(now f1) and f3
+    um.push(FB.util.deepClone(fields));
+    tmp = fields[1]; fields[1] = fields[2]; fields[2] = tmp;
+    // Undo step 2
+    var step1 = um.undo(fields);
+    FB.TestRunner.assertEqual(step1[0].id, 'f2', 'after undo step2 pos0');
+    FB.TestRunner.assertEqual(step1[1].id, 'f1', 'after undo step2 pos1');
+    FB.TestRunner.assertEqual(step1[2].id, 'f3', 'after undo step2 pos2');
+    // Undo step 1
+    var step0 = um.undo(step1);
+    FB.TestRunner.assertEqual(step0[0].id, 'f1', 'after undo step1 pos0');
+    FB.TestRunner.assertEqual(step0[1].id, 'f2', 'after undo step1 pos1');
+    FB.TestRunner.assertEqual(step0[2].id, 'f3', 'after undo step1 pos2');
+  });
+
+  FB.TestRunner.test('undo preserves field properties after reorder', function () {
+    var fields = [
+      makeField('f1', 'text', 'Name', { required: true, placeholder: 'Enter name' }),
+      makeField('f2', 'number', 'Age', { validation: { min: '0', max: '150' } })
+    ];
+    var um = new FB.UndoManager();
+    um.push(FB.util.deepClone(fields));
+    var moved = fields.splice(0, 1)[0];
+    fields.push(moved);
+    var prev = um.undo(fields);
+    FB.TestRunner.assertEqual(prev[0].required, true, 'required preserved');
+    FB.TestRunner.assertEqual(prev[0].placeholder, 'Enter name', 'placeholder preserved');
+    FB.TestRunner.assertEqual(prev[1].validation.min, '0', 'validation preserved');
+  });
+
+  FB.TestRunner.test('undo across publish boundary requires confirmation', function () {
+    var fields = [makeField('f1', 'text', 'A')];
+    var um = new FB.UndoManager();
+    um.push(FB.util.deepClone(fields));
+    um.markBoundary('publish v1');
+    fields[0].label = 'B';
+    um.push(FB.util.deepClone(fields));
+    // First undo: back to after boundary
+    var prev1 = um.undo(fields);
+    FB.TestRunner.assertEqual(prev1[0].label, 'B', 'before boundary state');
+    // Second undo hits boundary
+    var prev2 = um.undo(prev1);
+    FB.TestRunner.assert(prev2._crossedBoundary, 'boundary detected');
+    FB.TestRunner.assertEqual(prev2._label, 'publish v1', 'boundary label');
+    // Force past boundary
+    var prev3 = um.popBoundary(prev1);
+    FB.TestRunner.assertEqual(prev3[0].label, 'A', 'restored pre-boundary');
+  });
+
+  // =========================================================
+  // Suite 14: Condition Field Deletion Cleanup
+  // =========================================================
+  FB.TestRunner.suite('Condition Field Deletion Cleanup');
+
+  FB.TestRunner.test('deleting referenced field cleans conditions via _removeConditionReferences', function () {
+    var f1 = makeField('f1', 'radio', '类型', { options: [{ label: 'A', value: 'a' }] });
+    var f2 = makeField('f2', 'text', '依赖字段', { conditions: [{ field: 'f1', operator: 'equals', value: 'a' }] });
+    var fields = [f1, f2];
+    FB.Designer.prototype._removeConditionReferences(fields, 'f1');
+    FB.TestRunner.assertEqual(f2.conditions.length, 0, 'condition removed');
+  });
+
+  FB.TestRunner.test('cleanup preserves conditions referencing other fields', function () {
+    var f1 = makeField('f1', 'text', 'A');
+    var f2 = makeField('f2', 'text', 'B');
+    var f3 = makeField('f3', 'text', 'C', {
+      conditions: [
+        { field: 'f1', operator: 'equals', value: 'x' },
+        { field: 'f2', operator: 'notEmpty', value: '' }
+      ]
+    });
+    FB.Designer.prototype._removeConditionReferences([f1, f2, f3], 'f1');
+    FB.TestRunner.assertEqual(f3.conditions.length, 1, 'one condition remains');
+    FB.TestRunner.assertEqual(f3.conditions[0].field, 'f2', 'correct condition kept');
+  });
+
+  FB.TestRunner.test('cleanup works for group children', function () {
+    var f1 = makeField('f1', 'text', 'Control');
+    var child = makeField('c1', 'text', 'Child', { conditions: [{ field: 'f1', operator: 'equals', value: 'show' }] });
+    var g = makeField('g1', 'group', 'Group');
+    g.children = [child];
+    FB.Designer.prototype._removeConditionReferences([f1, g], 'f1');
+    FB.TestRunner.assertEqual(child.conditions.length, 0, 'child condition cleaned');
+  });
+
+  FB.TestRunner.test('cleanup handles fields with no conditions', function () {
+    var f1 = makeField('f1', 'text', 'A');
+    var f2 = makeField('f2', 'text', 'B');
+    // f2 has no conditions array set (default empty)
+    FB.Designer.prototype._removeConditionReferences([f1, f2], 'f1');
+    FB.TestRunner.assertEqual(f2.conditions.length, 0, 'no error on empty conditions');
+  });
+
+  FB.TestRunner.test('multiple fields referencing deleted field all cleaned', function () {
+    var f1 = makeField('f1', 'text', 'Source');
+    var f2 = makeField('f2', 'text', 'Dep1', { conditions: [{ field: 'f1', operator: 'equals', value: 'a' }] });
+    var f3 = makeField('f3', 'text', 'Dep2', { conditions: [{ field: 'f1', operator: 'notEmpty', value: '' }] });
+    FB.Designer.prototype._removeConditionReferences([f1, f2, f3], 'f1');
+    FB.TestRunner.assertEqual(f2.conditions.length, 0, 'dep1 cleaned');
+    FB.TestRunner.assertEqual(f3.conditions.length, 0, 'dep2 cleaned');
+  });
+
+  // =========================================================
+  // Suite 15: Orphan Condition Handling (isFieldHidden)
+  // =========================================================
+  FB.TestRunner.suite('Orphan Condition Handling');
+
+  FB.TestRunner.test('field with orphaned condition is NOT hidden', function () {
+    var f1 = makeField('f1', 'text', 'Visible', {
+      conditions: [{ field: 'deleted_field', operator: 'equals', value: 'x' }]
+    });
+    var allFields = [f1]; // deleted_field not in allFields
+    var values = { f1: '' };
+    var hidden = FB.logic.isFieldHidden(f1, values, allFields);
+    FB.TestRunner.assert(!hidden, 'not hidden when condition references deleted field');
+  });
+
+  FB.TestRunner.test('field with valid condition still hides correctly', function () {
+    var f1 = makeField('f1', 'radio', 'Control', { options: [{ label: 'A', value: 'a' }] });
+    var f2 = makeField('f2', 'text', 'Dependent', {
+      conditions: [{ field: 'f1', operator: 'equals', value: 'a' }]
+    });
+    var allFields = [f1, f2];
+    // Control field has value 'b' (not 'a'), so condition not met → hidden
+    var hidden = FB.logic.isFieldHidden(f2, { f1: 'b', f2: '' }, allFields);
+    FB.TestRunner.assert(hidden, 'hidden when condition not met');
+    // Control field has value 'a', condition met → visible
+    var visible = !FB.logic.isFieldHidden(f2, { f1: 'a', f2: '' }, allFields);
+    FB.TestRunner.assert(visible, 'visible when condition met');
+  });
+
+  FB.TestRunner.test('mixed valid and orphan conditions: orphan skipped', function () {
+    var f1 = makeField('f1', 'text', 'Exists');
+    var f2 = makeField('f2', 'text', 'Target', {
+      conditions: [
+        { field: 'deleted_field', operator: 'equals', value: 'x' },
+        { field: 'f1', operator: 'notEmpty', value: '' }
+      ]
+    });
+    var allFields = [f1, f2];
+    // f1 is not empty → valid condition met, orphan skipped → visible
+    var hidden1 = FB.logic.isFieldHidden(f2, { f1: 'hello', f2: '' }, allFields);
+    FB.TestRunner.assert(!hidden1, 'visible: orphan skipped, valid condition met');
+    // f1 is empty → valid condition not met → hidden
+    var hidden2 = FB.logic.isFieldHidden(f2, { f1: '', f2: '' }, allFields);
+    FB.TestRunner.assert(hidden2, 'hidden: valid condition not met');
+  });
+
+  FB.TestRunner.test('all conditions orphaned = field visible', function () {
+    var f = makeField('f1', 'text', 'AllOrphan', {
+      conditions: [
+        { field: 'gone1', operator: 'equals', value: 'x' },
+        { field: 'gone2', operator: 'notEmpty', value: '' }
+      ]
+    });
+    var hidden = FB.logic.isFieldHidden(f, { f1: '' }, [f]);
+    FB.TestRunner.assert(!hidden, 'visible when all conditions orphaned');
+  });
+
+  FB.TestRunner.test('no allFields param falls back to old behavior', function () {
+    var f = makeField('f1', 'text', 'NoContext', {
+      conditions: [{ field: 'missing', operator: 'equals', value: 'x' }]
+    });
+    // Without allFields, cannot detect orphan → falls back to evalCondition which returns false → hidden
+    var hidden = FB.logic.isFieldHidden(f, { f1: '' }, null);
+    FB.TestRunner.assert(hidden, 'hidden without allFields context');
+  });
+
+  // =========================================================
+  // Suite 16: Import Config Field ID Mapping
+  // =========================================================
+  FB.TestRunner.suite('Import Config Field ID Mapping');
+
+  FB.TestRunner.test('_ensureFieldIds assigns IDs to fields without them', function () {
+    var fields = [
+      { type: 'text', label: 'No ID', conditions: [], validation: {} },
+      { id: 'existing', type: 'text', label: 'Has ID', conditions: [], validation: {} }
+    ];
+    FB.App._ensureFieldIds(fields);
+    FB.TestRunner.assert(!!fields[0].id, 'id assigned');
+    FB.TestRunner.assertEqual(fields[1].id, 'existing', 'existing id preserved');
+  });
+
+  FB.TestRunner.test('_ensureFieldIds handles subFields', function () {
+    var fields = [{
+      id: 't1', type: 'table', label: 'Table', conditions: [], validation: {},
+      subFields: [{ type: 'text', label: 'Col', validation: {} }]
+    }];
+    FB.App._ensureFieldIds(fields);
+    FB.TestRunner.assert(!!fields[0].subFields[0].id, 'subfield id assigned');
+  });
+
+  FB.TestRunner.test('_ensureFieldIds handles group children', function () {
+    var fields = [{
+      id: 'g1', type: 'group', label: 'Group', conditions: [], validation: {},
+      children: [{ type: 'text', label: 'Child', conditions: [], validation: {} }]
+    }];
+    FB.App._ensureFieldIds(fields);
+    FB.TestRunner.assert(!!fields[0].children[0].id, 'child id assigned');
+  });
+
+  FB.TestRunner.test('import validates and publishes template', function () {
+    var tpl = {
+      id: 'import_test_001',
+      name: '导入测试',
+      fields: [
+        { id: 'f1', type: 'text', label: '字段1', conditions: [], validation: {} },
+        { id: 'f2', type: 'text', label: '字段2', conditions: [], validation: {} }
+      ]
+    };
+    var validation = FB.io.validateImport(tpl);
+    FB.TestRunner.assert(validation.valid, 'valid import');
+    FB.TestRunner.assertEqual(validation.errors.length, 0, 'no errors');
+  });
+
+  FB.TestRunner.test('import rejects template without name', function () {
+    var tpl = { fields: [{ id: 'f1', type: 'text', label: 'A' }] };
+    var validation = FB.io.validateImport(tpl);
+    FB.TestRunner.assert(!validation.valid, 'invalid');
+    FB.TestRunner.assert(validation.errors.length > 0, 'has errors');
+  });
+
+  // =========================================================
+  // Suite 17: CSV Column Alignment
+  // =========================================================
+  FB.TestRunner.suite('CSV Column Alignment');
+
+  FB.TestRunner.test('CSV columns align when table is between regular fields', function () {
+    var tpl = makeTpl('T', [
+      makeField('f1', 'text', '姓名'),
+      makeField('t1', 'table', '明细', {
+        subFields: [
+          { id: 'sf1', type: 'text', label: '项目', required: false, validation: {} },
+          { id: 'sf2', type: 'number', label: '金额', required: false, validation: {} }
+        ]
+      }),
+      makeField('f2', 'text', '备注')
+    ]);
+    var data = {
+      f1: '张三',
+      t1: [{ sf1: '项目A', sf2: '100' }],
+      f2: '无'
+    };
+    var csv = FB.io.exportDataCSV(tpl, data);
+    var lines = csv.split('\n');
+    var headers = lines[0].split(',');
+    var values = lines[1].split(',');
+    // Headers: 姓名, 明细.项目, 明细.金额, 备注
+    FB.TestRunner.assertEqual(headers[0], '姓名', 'header 0');
+    FB.TestRunner.assertEqual(headers[1], '明细.项目', 'header 1');
+    FB.TestRunner.assertEqual(headers[2], '明细.金额', 'header 2');
+    FB.TestRunner.assertEqual(headers[3], '备注', 'header 3');
+    // Values should match header positions
+    FB.TestRunner.assertEqual(values[0], '张三', 'value 0 = 姓名');
+    FB.TestRunner.assertEqual(values[1], '项目A', 'value 1 = 明细.项目');
+    FB.TestRunner.assertEqual(values[2], '100', 'value 2 = 明细.金额');
+    FB.TestRunner.assertEqual(values[3], '无', 'value 3 = 备注');
+  });
+
+  FB.TestRunner.test('CSV with no table fields still works', function () {
+    var tpl = makeTpl('T', [
+      makeField('f1', 'text', 'A'),
+      makeField('f2', 'text', 'B')
+    ]);
+    var data = { f1: 'x', f2: 'y' };
+    var csv = FB.io.exportDataCSV(tpl, data);
+    var lines = csv.split('\n');
+    FB.TestRunner.assertEqual(lines[0], 'A,B', 'headers');
+    FB.TestRunner.assertEqual(lines[1], 'x,y', 'values');
+  });
+
+  FB.TestRunner.test('CSV escapes commas in values', function () {
+    var tpl = makeTpl('T', [makeField('f1', 'text', 'A')]);
+    var data = { f1: 'hello, world' };
+    var csv = FB.io.exportDataCSV(tpl, data);
+    var lines = csv.split('\n');
+    FB.TestRunner.assert(lines[1].indexOf('"hello, world"') >= 0, 'comma escaped');
+  });
+
+  FB.TestRunner.test('CSV multiple table rows expand correctly', function () {
+    var tpl = makeTpl('T', [
+      makeField('f1', 'text', '标题'),
+      makeField('t1', 'table', '表', {
+        subFields: [{ id: 'sf1', type: 'text', label: '列1', required: false, validation: {} }]
+      })
+    ]);
+    var data = {
+      f1: 'test',
+      t1: [{ sf1: 'row1' }, { sf1: 'row2' }, { sf1: 'row3' }]
+    };
+    var csv = FB.io.exportDataCSV(tpl, data);
+    var lines = csv.split('\n');
+    FB.TestRunner.assertEqual(lines.length, 4, '1 header + 3 data rows');
+    FB.TestRunner.assertEqual(lines[1].split(',')[0], 'test', 'regular field in row 1');
+    FB.TestRunner.assertEqual(lines[2].split(',')[0], '', 'regular field empty in row 2');
+    FB.TestRunner.assertEqual(lines[1].split(',')[1], 'row1', 'table row 1');
+    FB.TestRunner.assertEqual(lines[2].split(',')[1], 'row2', 'table row 2');
+    FB.TestRunner.assertEqual(lines[3].split(',')[1], 'row3', 'table row 3');
+  });
+
+  // =========================================================
+  // Suite 18: Preview and Designer Round Trip
+  // =========================================================
+  FB.TestRunner.suite('Preview and Designer Round Trip');
+
+  FB.TestRunner.test('renderer does not mutate template fields', function () {
+    var tpl = makeTpl('T', [
+      makeField('f1', 'text', 'A', { required: true }),
+      makeField('f2', 'radio', 'B', { options: [{ label: 'X', value: 'x' }, { label: 'Y', value: 'y' }] })
+    ]);
+    var original = JSON.stringify(tpl);
+    // Simulate renderer init (values setup)
+    var values = {};
+    for (var i = 0; i < tpl.fields.length; i++) {
+      var f = tpl.fields[i];
+      values[f.id] = f.defaultValue || '';
+    }
+    // Template should not be modified
+    FB.TestRunner.assertEqual(JSON.stringify(tpl), original, 'template unchanged');
+  });
+
+  FB.TestRunner.test('condition evaluation uses current values', function () {
+    var f1 = makeField('f1', 'radio', 'Control', { options: [{ label: 'Show', value: 'show' }, { label: 'Hide', value: 'hide' }] });
+    var f2 = makeField('f2', 'text', 'Target', { conditions: [{ field: 'f1', operator: 'equals', value: 'show' }] });
+    var allFields = [f1, f2];
+    // Initially control is 'hide' → target hidden
+    var values = { f1: 'hide', f2: '' };
+    FB.TestRunner.assert(FB.logic.isFieldHidden(f2, values, allFields), 'hidden initially');
+    // Change control to 'show' → target visible
+    values.f1 = 'show';
+    FB.TestRunner.assert(!FB.logic.isFieldHidden(f2, values, allFields), 'visible after change');
+  });
+
+  FB.TestRunner.test('validation skips hidden fields', function () {
+    var f1 = makeField('f1', 'radio', 'Control', { options: [{ label: 'A', value: 'a' }] });
+    var f2 = makeField('f2', 'text', 'Hidden Required', { required: true, conditions: [{ field: 'f1', operator: 'equals', value: 'show' }] });
+    var tpl = makeTpl('T', [f1, f2]);
+    // f1 = 'a' (not 'show'), so f2 is hidden → should not cause validation error
+    var result = FB.validate.validateForm(tpl, { f1: 'a', f2: '' });
+    FB.TestRunner.assert(result.valid, 'valid: hidden required field skipped');
+  });
+
+  FB.TestRunner.test('draft data preserves template version', function () {
+    var tpl = makeTpl('T', [makeField('f1', 'text', 'A')]);
+    publishTpl(tpl);
+    var data = { f1: 'hello', _templateVersion: 1, _recordId: 'rec1', _draft: true, _savedAt: FB.util.now() };
+    FB.storage.saveFormData(tpl.id, 'rec1', data);
+    var retrieved = FB.storage.getFormData(tpl.id, 'rec1');
+    FB.TestRunner.assertEqual(retrieved.data._templateVersion, 1, 'version preserved');
+    FB.TestRunner.assert(retrieved.data._draft, 'draft flag preserved');
+  });
+
+  FB.TestRunner.test('enum option value change detected by diff', function () {
+    var f1 = makeField('f1', 'radio', '类型', { options: [{ label: '选项A', value: 'opt_a' }, { label: '选项B', value: 'opt_b' }] });
+    var f2 = makeField('f1', 'radio', '类型', { options: [{ label: '选项A改', value: 'opt_a' }, { label: '选项C', value: 'opt_c' }] });
+    var diff = FB.migration.diffTemplates(makeTpl('T', [f1]), makeTpl('T', [f2]));
+    FB.TestRunner.assertEqual(diff.optionsChanged.length, 1, 'options changed detected');
+    // opt_b removed, opt_c added, opt_a label renamed
+    FB.TestRunner.assertEqual(diff.optionsChanged[0].removedOptions.length, 1, 'removed opt_b');
+    FB.TestRunner.assertEqual(diff.optionsChanged[0].removedOptions[0].value, 'opt_b', 'removed value');
+    FB.TestRunner.assertEqual(diff.optionsChanged[0].addedOptions.length, 1, 'added opt_c');
+    FB.TestRunner.assertEqual(diff.optionsChanged[0].renamedOptions.length, 1, 'renamed opt_a label');
+  });
+
   // Auto-run on load
   console.log('测试套件已加载。运行 FB.TestRunner.runAll() 执行全部测试。');
 

@@ -652,6 +652,8 @@
           break;
         }
       }
+      // Clean up dangling condition references in all fields
+      this._removeConditionReferences(this.template.fields, fieldId);
       if (this.selectedFieldId === fieldId) {
         this.selectedFieldId = null;
         this._renderPropertyPanel();
@@ -1086,6 +1088,20 @@
           field.conditions.push({ field: '', operator: 'equals', value: '' });
           self._renderPropertyPanel();
         });
+      }
+    },
+
+    _removeConditionReferences: function (fields, deletedFieldId) {
+      for (var i = 0; i < fields.length; i++) {
+        var f = fields[i];
+        if (f.conditions && f.conditions.length > 0) {
+          f.conditions = f.conditions.filter(function (c) {
+            return c.field !== deletedFieldId;
+          });
+        }
+        if (f.type === 'group' && f.children) {
+          this._removeConditionReferences(f.children, deletedFieldId);
+        }
       }
     }
   };

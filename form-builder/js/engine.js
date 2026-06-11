@@ -379,14 +379,23 @@
   FB.logic = {
     isFieldHidden: function (field, values, allFields) {
       if (!field.conditions || field.conditions.length === 0) return false;
+      // Build active field map so we can skip orphaned condition references
+      var activeFieldMap = null;
+      if (allFields) {
+        activeFieldMap = {};
+        this._buildFieldMap(allFields, activeFieldMap);
+      }
       for (var i = 0; i < field.conditions.length; i++) {
-        if (!this._evalCondition(field.conditions[i], values)) return true;
+        var cond = field.conditions[i];
+        // Skip conditions whose referenced field has been deleted or doesn't exist
+        if (cond.field && activeFieldMap && !activeFieldMap[cond.field]) continue;
+        if (!this._evalCondition(cond, values)) return true;
       }
       return false;
     },
 
     _evalCondition: function (cond, values) {
-      // Guard: if referenced field doesn't exist in values at all, treat as false
+      // Guard: if referenced field doesn't exist in values, treat as "not met"
       if (cond.field && !(cond.field in values)) {
         return false;
       }
@@ -629,7 +638,7 @@
     exportDataCSV: function (template, data) {
       var fields = template.fields.filter(function (f) { return !f._deleted; });
       var headers = [];
-      var values = [];
+      var colMeta = [];
 
       for (var i = 0; i < fields.length; i++) {
         var f = fields[i];
@@ -638,42 +647,45 @@
             for (var j = 0; j < f.subFields.length; j++) {
               if (f.subFields[j]._deleted) continue;
               headers.push(f.label + '.' + f.subFields[j].label);
+              colMeta.push({ type: 'table', fieldId: f.id, subFieldId: f.subFields[j].id });
             }
           }
         } else if (f.type === 'group') {
           // skip
         } else {
           headers.push(f.label);
-          var v = data[f.id];
-          if (Array.isArray(v)) values.push(v.join('; '));
-          else values.push(v !== undefined ? String(v) : '');
+          colMeta.push({ type: 'field', fieldId: f.id });
         }
       }
 
-      var tableFields = fields.filter(function (f) { return f.type === 'table'; });
-      var lines = [headers.join(',')];
-      if (tableFields.length > 0) {
-        var maxRows = 1;
-        for (var ti = 0; ti < tableFields.length; ti++) {
-          var td = data[tableFields[ti].id] || [];
+      var maxRows = 1;
+      for (var ti = 0; ti < fields.length; ti++) {
+        if (fields[ti].type === 'table') {
+          var td = data[fields[ti].id] || [];
           if (td.length > maxRows) maxRows = td.length;
         }
-        for (var ri = 0; ri < maxRows; ri++) {
-          var row = values.slice();
-          for (var tf = 0; tf < tableFields.length; tf++) {
-            var tableData = data[tableFields[tf].id] || [];
-            var rowData = tableData[ri] || {};
-            if (tableFields[tf].subFields) {
-              for (var sfi = 0; sfi < tableFields[tf].subFields.length; sfi++) {
-                if (tableFields[tf].subFields[sfi]._deleted) continue;
-                row.push(this._csvEscape(rowData[tableFields[tf].subFields[sfi].id] || ''));
-              }
+      }
+
+      var lines = [headers.join(',')];
+      for (var ri = 0; ri < maxRows; ri++) {
+        var row = [];
+        for (var ci = 0; ci < colMeta.length; ci++) {
+          var meta = colMeta[ci];
+          if (meta.type === 'field') {
+            if (ri === 0) {
+              var v = data[meta.fieldId];
+              if (Array.isArray(v)) row.push(this._csvEscape(v.join('; ')));
+              else row.push(this._csvEscape(v !== undefined ? String(v) : ''));
+            } else {
+              row.push('');
             }
+          } else {
+            var tableData = data[meta.fieldId] || [];
+            var rowData = tableData[ri] || {};
+            row.push(this._csvEscape(rowData[meta.subFieldId] !== undefined ? String(rowData[meta.subFieldId]) : ''));
           }
-          lines.push(row.join(','));
         }
-      } else {
-        lines.push(values.join(','));
+        lines.push(row.join(','));
       }
       return lines.join('\n');
     },
@@ -728,8 +740,8 @@
     },
 
     exportAllDataJSON: function (templateId, mode) {
-      var allData = this.getFormDataAll(templateId);
-      var tpl = this.getTemplateLatest(templateId);
+      var allData = FB.storage.getFormDataAll(templateId);
+      var tpl = FB.storage.getTemplateLatest(templateId);
       if (!tpl) return JSON.stringify({ error: 'template not found' });
       var records = [];
       for (var i = 0; i < allData.length; i++) {
