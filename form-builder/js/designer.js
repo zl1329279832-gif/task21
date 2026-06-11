@@ -48,6 +48,7 @@
         createdAt: FB.util.now(),
         updatedAt: FB.util.now()
       };
+      this._changeLog = [];
       $('#template-name').value = this.template.name;
       this._render();
     },
@@ -55,8 +56,14 @@
     /* ---- Load existing template ---- */
     loadTemplate: function (tpl) {
       this.template = FB.util.deepClone(tpl);
+      // Sanitize dangling condition references from historical data
+      var sanitizeResult = FB.util.sanitizeTemplateRefs(this.template);
+      if (sanitizeResult.changes.length > 0) {
+        FB.App.toast('已自动清理 ' + sanitizeResult.changes.length + ' 条悬空联动条件', 'info');
+      }
       $('#template-name').value = this.template.name;
       this.selectedFieldId = null;
+      this._changeLog = [];
       this.undoManager.clear();
       this._render();
       this._renderPropertyPanel();
@@ -117,6 +124,10 @@
 
     _doPublish: function (migrationConfig) {
       this.template.updatedAt = FB.util.now();
+      // Attach change log for traceability
+      if (this._changeLog && this._changeLog.length > 0) {
+        this.template._changeLog = FB.util.deepClone(this._changeLog);
+      }
       var published = FB.storage.publishTemplate(this.template);
 
       if (migrationConfig) {
@@ -127,6 +138,8 @@
       }
 
       this.undoManager.markBoundary('publish v' + published.version);
+      // Reset change log after publish
+      this._changeLog = [];
       FB.App.toast('模板已发布 (v' + published.version + ')', 'success');
       FB.App.refreshTemplateSelects();
     },
@@ -441,6 +454,8 @@
           var newField = FB.createField(self._dragData.type);
           self.template.fields.splice(insertIndex, 0, newField);
           self.selectedFieldId = newField.id;
+          if (!self._changeLog) self._changeLog = [];
+          self._changeLog.push({ ts: Date.now(), action: 'add', fieldId: newField.id, detail: '添加字段: ' + newField.label });
         } else if (self._dragData.source === 'canvas') {
           self._saveUndoState();
           var fromIndex = -1;
@@ -451,6 +466,8 @@
             var moved = self.template.fields.splice(fromIndex, 1)[0];
             var adjustedIndex = insertIndex > fromIndex ? insertIndex - 1 : insertIndex;
             self.template.fields.splice(adjustedIndex, 0, moved);
+            if (!self._changeLog) self._changeLog = [];
+            self._changeLog.push({ ts: Date.now(), action: 'reorder', fieldId: moved.id, detail: '拖拽重排: ' + moved.label + ' (索引 ' + fromIndex + ' → ' + adjustedIndex + ')' });
           }
         }
         self._dragData = null;
@@ -622,24 +639,40 @@
       var tmp = this.template.fields[idx];
       this.template.fields[idx] = this.template.fields[newIdx];
       this.template.fields[newIdx] = tmp;
+      if (!this._changeLog) this._changeLog = [];
+      this._changeLog.push({
+        ts: Date.now(),
+        action: 'reorder',
+        fieldId: fieldId,
+        detail: '移动字段 ' + this.template.fields[newIdx].label + ' (索引 ' + idx + ' → ' + newIdx + ')'
+      });
       this._render();
     },
 
     _deleteField: function (fieldId) {
+      // Find the field label for the change log
+      var deletedLabel = fieldId;
+      for (var fi = 0; fi < this.template.fields.length; fi++) {
+        if (this.template.fields[fi].id === fieldId) {
+          deletedLabel = this.template.fields[fi].label;
+          break;
+        }
+      }
+
       // Check for dependent fields before deleting
       var dependents = FB.logic.getDependents(fieldId, this.template.fields);
       if (dependents.length > 0) {
         var depLabels = [];
         for (var di = 0; di < dependents.length; di++) {
-          for (var fi = 0; fi < this.template.fields.length; fi++) {
-            if (this.template.fields[fi].id === dependents[di]) {
-              depLabels.push(this.template.fields[fi].label);
+          for (var fi2 = 0; fi2 < this.template.fields.length; fi2++) {
+            if (this.template.fields[fi2].id === dependents[di]) {
+              depLabels.push(this.template.fields[fi2].label);
               break;
             }
           }
         }
         if (!confirm('以下字段依赖此字段的联动条件：\n' + depLabels.join('、') +
-            '\n\n删除后这些条件将失效。是否继续？')) {
+            '\n\n删除后这些条件将自动清除。是否继续？')) {
           return;
         }
       }
@@ -652,6 +685,23 @@
           break;
         }
       }
+
+      // Auto-clean up conditions that referenced the deleted field
+      var sanitizeResult = FB.util.sanitizeTemplateRefs(this.template);
+      if (sanitizeResult.changes.length > 0) {
+        FB.App.toast('已自动清除 ' + sanitizeResult.changes.length + ' 条引用此字段的联动条件', 'info');
+      }
+
+      // Log the change
+      if (!this._changeLog) this._changeLog = [];
+      this._changeLog.push({
+        ts: Date.now(),
+        action: 'delete',
+        fieldId: fieldId,
+        detail: '删除字段: ' + deletedLabel +
+          (sanitizeResult.changes.length > 0 ? '，清理 ' + sanitizeResult.changes.length + ' 条悬空条件' : '')
+      });
+
       if (this.selectedFieldId === fieldId) {
         this.selectedFieldId = null;
         this._renderPropertyPanel();

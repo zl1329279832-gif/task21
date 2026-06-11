@@ -156,7 +156,7 @@
 
       $('#btn-save-draft-fill').disabled = false;
       $('#btn-submit-fill').disabled = false;
-      var versionInfo = tpl.version ? ' (v' + tpl.version + ')' : '';
+      var versionInfo = template.version ? ' (v' + template.version + ')' : '';
       $('#fill-status').textContent = '填报中...' + versionInfo;
 
       if (this._autoSaveTimer) clearInterval(this._autoSaveTimer);
@@ -522,6 +522,28 @@
         tpl._originalVersion = data.version || 0;
 
         this._ensureFieldIds(tpl.fields);
+
+        // Sanitize dangling condition references
+        var sanitizeResult = FB.util.sanitizeTemplateRefs(tpl);
+        var sanitizeWarning = '';
+        if (sanitizeResult.changes.length > 0) {
+          sanitizeWarning = '<br><span style="color:var(--warning);">⚠ 已自动清理 ' +
+            sanitizeResult.changes.length + ' 条悬空的联动条件引用</span>';
+          for (var si = 0; si < sanitizeResult.changes.length; si++) {
+            sanitizeWarning += '<br><span style="color:#999;font-size:11px;">&nbsp;&nbsp;- 字段 "' +
+              FB.util.escapeHtml(sanitizeResult.changes[si].fieldLabel) + '": ' +
+              FB.util.escapeHtml(sanitizeResult.changes[si].reason) + '</span>';
+          }
+        }
+
+        // Check for circular dependencies
+        var cycles = FB.logic.detectCycles(tpl.fields);
+        var cycleWarning = '';
+        if (cycles.length > 0) {
+          cycleWarning = '<br><span style="color:var(--danger);">⚠ 检测到 ' + cycles.length +
+            ' 个循环依赖，请在导入后检查联动条件</span>';
+        }
+
         FB.storage.saveTemplateDraft(tpl);
         var published = FB.storage.publishTemplate(tpl);
 
@@ -537,7 +559,7 @@
           '<br>版本: v' + published.version +
           '<br>字段数: ' + tpl.fields.length +
           (tpl._importSource ? '<br><span style="font-size:11px;color:#999;">来源: 导入</span>' : '') +
-          warnings;
+          warnings + sanitizeWarning + cycleWarning;
         self.toast('模板导入成功', 'success');
         self.refreshTemplateSelects();
 

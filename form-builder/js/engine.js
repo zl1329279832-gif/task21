@@ -20,7 +20,84 @@
     debounce: function (fn, ms) {
       var t; return function () { var a = arguments; clearTimeout(t); t = setTimeout(function () { fn.apply(null, a); }, ms); };
     },
-    now: function () { return new Date().toISOString(); }
+    now: function () { return new Date().toISOString(); },
+
+    /**
+     * Collect all field IDs from the field tree (including _deleted fields,
+     * group children, and table subFields).
+     */
+    collectAllFieldIds: function (fields) {
+      var ids = [];
+      var walk = function (arr) {
+        for (var i = 0; i < arr.length; i++) {
+          var f = arr[i];
+          if (f.id) ids.push(f.id);
+          if (f.type === 'group' && f.children) walk(f.children);
+          if (f.type === 'table' && f.subFields) {
+            for (var j = 0; j < f.subFields.length; j++) {
+              if (f.subFields[j].id) ids.push(f.subFields[j].id);
+            }
+          }
+        }
+      };
+      walk(fields);
+      return ids;
+    },
+
+    /**
+     * Check if a targetId exists anywhere in the field tree.
+     * If includeDeleted is true, also checks _deleted fields.
+     */
+    hasFieldId: function (fields, targetId, includeDeleted) {
+      for (var i = 0; i < fields.length; i++) {
+        var f = fields[i];
+        if (f.id === targetId && (includeDeleted || !f._deleted)) return true;
+        if (f.type === 'group' && f.children) {
+          if (this.hasFieldId(f.children, targetId, includeDeleted)) return true;
+        }
+        if (f.type === 'table' && f.subFields) {
+          for (var j = 0; j < f.subFields.length; j++) {
+            if (f.subFields[j].id === targetId && (includeDeleted || !f.subFields[j]._deleted)) return true;
+          }
+        }
+      }
+      return false;
+    },
+
+    /**
+     * Scan all fields' conditions and remove any that reference non-existent
+     * or _deleted field IDs. Returns { changes: [...] } describing what was cleaned.
+     */
+    sanitizeTemplateRefs: function (template) {
+      var changes = [];
+      var validIds = this.collectAllFieldIds(template.fields);
+      var validMap = {};
+      for (var k = 0; k < validIds.length; k++) validMap[validIds[k]] = true;
+
+      var walk = function (fields, parentLabel) {
+        for (var i = 0; i < fields.length; i++) {
+          var f = fields[i];
+          if (f.conditions && f.conditions.length > 0) {
+            var before = f.conditions.length;
+            f.conditions = f.conditions.filter(function (cond) {
+              if (!cond.field) return true; // empty condition, keep
+              if (validMap[cond.field]) return true; // valid reference
+              changes.push({
+                fieldId: f.id,
+                fieldLabel: f.label,
+                parentLabel: parentLabel || null,
+                removedCondition: FB.util.deepClone(cond),
+                reason: '引用字段 ' + cond.field + ' 不存在'
+              });
+              return false;
+            });
+          }
+          if (f.type === 'group' && f.children) walk(f.children, f.label);
+        }
+      };
+      walk(template.fields, null);
+      return { changes: changes };
+    }
   };
 
   /* =========================================================
@@ -377,17 +454,43 @@
      4. Logic Engine - Conditional display + cycle detection
      ========================================================= */
   FB.logic = {
+    /**
+     * Check if a field should be hidden based on its conditions.
+     * - If no conditions: field is always visible (return false).
+     * - Orphaned conditions (referencing deleted/missing fields) are skipped.
+     * - If ALL conditions are orphaned: field is visible (treat as no conditions).
+     * - Otherwise: field is hidden if ANY valid condition is not met.
+     */
     isFieldHidden: function (field, values, allFields) {
       if (!field.conditions || field.conditions.length === 0) return false;
+
+      var validConditions = [];
       for (var i = 0; i < field.conditions.length; i++) {
-        if (!this._evalCondition(field.conditions[i], values)) return true;
+        var cond = field.conditions[i];
+        if (!cond.field) continue; // skip empty conditions
+        // Check if the referenced field still exists in the field tree
+        if (allFields && !FB.util.hasFieldId(allFields, cond.field, true)) {
+          continue; // skip orphaned condition
+        }
+        validConditions.push(cond);
+      }
+
+      // If all conditions are orphaned, treat as no conditions → visible
+      if (validConditions.length === 0) return false;
+
+      for (var j = 0; j < validConditions.length; j++) {
+        if (!this._evalCondition(validConditions[j], values)) return true;
       }
       return false;
     },
 
     _evalCondition: function (cond, values) {
-      // Guard: if referenced field doesn't exist in values at all, treat as false
+      // Guard: if referenced field doesn't exist in values at all
       if (cond.field && !(cond.field in values)) {
+        // For notEquals: absence of the field means it's not equal to anything → true
+        if (cond.operator === 'notEquals') return true;
+        // For notEmpty: absence means empty → false
+        // For all others: treat as false (condition not met)
         return false;
       }
       var depVal = values[cond.field];
@@ -517,17 +620,29 @@
       this._redoStack = [];
       this._notify();
     },
+    /**
+     * Undo: move back one step.
+     * Pushes currentState to redo stack, pops the top of undo stack,
+     * and returns the new top (the state to restore).
+     */
     undo: function (currentState) {
       if (this._stack.length === 0) return null;
-      var prev = this._stack[this._stack.length - 1];
+      var top = this._stack[this._stack.length - 1];
       // Detect boundary marker
+      if (top && top._boundary) {
+        return { _crossedBoundary: true, _label: top._label };
+      }
+      // Push current state to redo so we can redo back
+      this._redoStack.push(FB.util.deepClone(currentState));
+      // Pop the top (it's been "consumed")
+      this._stack.pop();
+      // Return the new top — the state to restore
+      if (this._stack.length === 0) return null;
+      var prev = this._stack[this._stack.length - 1];
       if (prev && prev._boundary) {
         return { _crossedBoundary: true, _label: prev._label };
       }
-      this._stack.pop();
-      this._redoStack.push(FB.util.deepClone(currentState));
-      this._notify();
-      return prev;
+      return FB.util.deepClone(prev);
     },
     /** Force pop past a boundary marker (called after user confirms) */
     popBoundary: function (currentState) {
@@ -536,12 +651,13 @@
       if (top && top._boundary) {
         this._stack.pop(); // remove boundary marker
       }
-      if (this._stack.length === 0) return null;
-      var prev = this._stack.pop();
-      this._redoStack.push(FB.util.deepClone(currentState));
-      this._notify();
-      return prev;
+      // Now perform a normal undo
+      return this.undo(currentState);
     },
+    /**
+     * Redo: move forward one step.
+     * Pushes currentState to undo stack, pops from redo stack and returns it.
+     */
     redo: function (currentState) {
       if (this._redoStack.length === 0) return null;
       this._stack.push(FB.util.deepClone(currentState));
@@ -571,14 +687,42 @@
   FB.io = {
     validateImport: function (data) {
       var errors = [];
+      var warnings = [];
       if (!data || typeof data !== 'object') {
-        return { valid: false, errors: ['无效的 JSON 对象'], template: null };
+        return { valid: false, errors: ['无效的 JSON 对象'], warnings: [], template: null };
       }
       if (!data.name || typeof data.name !== 'string')
         errors.push('缺少模板名称 (name)');
       if (!data.fields || !Array.isArray(data.fields))
         errors.push('缺少字段列表 (fields) 或格式不正确');
       else {
+        // Collect all field IDs for cross-reference validation
+        var allIds = {};
+        for (var ii = 0; ii < data.fields.length; ii++) {
+          var ff = data.fields[ii];
+          if (ff.id) allIds[ff.id] = true;
+          if (ff.type === 'table' && ff.subFields) {
+            for (var sfi = 0; sfi < ff.subFields.length; sfi++) {
+              if (ff.subFields[sfi].id) allIds[ff.subFields[sfi].id] = true;
+            }
+          }
+          if (ff.type === 'group' && ff.children) {
+            var collectChildIds = function (children) {
+              for (var ci = 0; ci < children.length; ci++) {
+                var cf = children[ci];
+                if (cf.id) allIds[cf.id] = true;
+                if (cf.type === 'group' && cf.children) collectChildIds(cf.children);
+                if (cf.type === 'table' && cf.subFields) {
+                  for (var csi = 0; csi < cf.subFields.length; csi++) {
+                    if (cf.subFields[csi].id) allIds[cf.subFields[csi].id] = true;
+                  }
+                }
+              }
+            };
+            collectChildIds(ff.children);
+          }
+        }
+
         for (var i = 0; i < data.fields.length; i++) {
           var f = data.fields[i];
           if (!f.id) errors.push('字段 [' + i + '] 缺少 id');
@@ -601,9 +745,18 @@
               }
             }
           }
+          // Check condition references
+          if (f.conditions && Array.isArray(f.conditions)) {
+            for (var ci = 0; ci < f.conditions.length; ci++) {
+              var cond = f.conditions[ci];
+              if (cond.field && !allIds[cond.field]) {
+                warnings.push('字段 "' + (f.label || f.id) + '" 的条件引用了不存在的字段 ' + cond.field + '（导入后将自动清理）');
+              }
+            }
+          }
         }
       }
-      return { valid: errors.length === 0, errors: errors, template: errors.length === 0 ? data : null };
+      return { valid: errors.length === 0, errors: errors, warnings: warnings, template: errors.length === 0 ? data : null };
     },
 
     exportTemplate: function (template) {
@@ -611,6 +764,7 @@
       clone._exportedAt = FB.util.now();
       clone._system = 'gov-form-builder';
       clone._exportVersion = 1;
+      clone._fieldIdManifest = FB.util.collectAllFieldIds(template.fields);
       return JSON.stringify(clone, null, 2);
     },
 

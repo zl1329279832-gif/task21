@@ -739,20 +739,37 @@
       var toggleField = function (field) {
         if (field._deleted) return;
 
-        // Check for orphaned conditions
+        // Check for orphaned conditions and mark visually
+        var hasOrphan = false;
         if (field.conditions) {
           for (var ci = 0; ci < field.conditions.length; ci++) {
             var condFieldId = field.conditions[ci].field;
             if (condFieldId && !fieldExists[condFieldId]) {
-              console.warn('[FormBuilder] 字段 "' + field.label + '" 的联动条件引用了已删除的字段 ' + condFieldId);
+              hasOrphan = true;
+              console.warn('[FormBuilder] 字段 "' + field.label + '" 的联动条件引用了已删除的字段 ' + condFieldId + '（该条件将被忽略）');
             }
           }
         }
 
         var el = form.querySelector('[data-field-id="' + field.id + '"]');
         if (el) {
+          // isFieldHidden now handles orphaned conditions gracefully
           var hidden = FB.logic.isFieldHidden(field, self.values, fields);
           el.classList.toggle('hidden-by-logic', hidden);
+          // Show orphan warning badge if applicable
+          var existingBadge = el.querySelector('.orphan-condition-badge');
+          if (hasOrphan && !hidden) {
+            if (!existingBadge) {
+              var badge = document.createElement('span');
+              badge.className = 'orphan-condition-badge';
+              badge.style.cssText = 'font-size:11px;color:#e65100;background:#fff3e0;padding:1px 6px;border-radius:3px;margin-left:8px;';
+              badge.textContent = '⚠ 条件引用已删除';
+              var label = el.querySelector('.form-field-label');
+              if (label) label.appendChild(badge);
+            }
+          } else if (existingBadge) {
+            existingBadge.remove();
+          }
         }
         if (field.type === 'group' && field.children) {
           for (var i = 0; i < field.children.length; i++) {
